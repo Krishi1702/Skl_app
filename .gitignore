@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+!.env.example
+!.env.local.example
+
+# Alembic generated revisions (keep .gitkeep)
+backend/alembic/versions/*.py
+!backend/alembic/versions/.gitkeep
+
+# Node
+node_modules/
+.npm
+npm-debug.log*
+
+# Next.js
+.next/
+out/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+coverage.xml
+
+# Docker volumes (if accidentally mounted locally)
+postgres_data/
+redis_data/
+minio_data/
+
+# Logs
+*.log
+logs/

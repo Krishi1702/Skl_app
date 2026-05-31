@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls //wsl.localhost/Ubuntu/home/shringesh/erp/frontend/node_modules/@tanstack/ 2>/dev/null && echo \"OK\")",
+      "Read(///wsl.localhost/Ubuntu/home/shringesh/erp/frontend/node_modules/**)",
+      "Bash(ls //wsl.localhost/Ubuntu/home/shringesh/erp/frontend/node_modules/date-fns/ 2>/dev/null | head -5 && echo \"date-fns OK\" *)",
+      "Bash(ls //wsl.localhost/Ubuntu/home/shringesh/erp/frontend/node_modules/@tanstack/)"
+    ]
+  }
+}

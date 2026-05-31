@@ -1,0 +1,46 @@
+version: "3.9"
+
+# Dev overrides: hot-reload, exposed ports, volume mounts
+services:
+
+  frontend:
+    build:
+      target: deps
+    command: npm run dev
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_API_URL: http://localhost/api/v1
+
+  backend:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+
+  worker:
+    volumes:
+      - ./backend:/app
+
+  ai-service:
+    volumes:
+      - ./ai-service:/app
+    ports:
+      - "8001:8001"
+
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  minio:
+    ports:
+      - "9000:9000"
+      - "9001:9001"

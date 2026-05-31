@@ -1,0 +1,3270 @@
+openapi: 3.0.3
+
+info:
+  title: School Reading & Assessment Platform API
+  version: 1.0.0
+  description: |
+    Complete REST API for the school oral reading and AI assessment platform.
+
+    ## Authentication
+    All endpoints except `/auth/register` and `/auth/login` require a JWT Bearer token
+    in the `Authorization: Bearer <token>` header. Access tokens expire in 15 minutes.
+    Use `/auth/refresh` to obtain a new one without re-logging in.
+
+    ## Roles
+    | Role    | Access                                                        |
+    |---------|---------------------------------------------------------------|
+    | admin   | School structure, user management, all assignments            |
+    | teacher | Their assigned sections, lesson upload, student progress view |
+    | student | Their section's lessons, reading sessions, personal dashboard |
+
+    ## Async Assessment Flow
+    1. `POST /student/sessions` — creates session record
+    2. Student records audio in browser via MediaRecorder API
+    3. `POST /student/sessions/{id}/submit` — uploads audio (WebM/OGG)
+    4. Server streams audio to Whisper STT microservice (audio never stored)
+    5. Transcript sent to Ollama LLM for assessment (BullMQ job)
+    6. **Socket.io** emits `assessment.complete` to student's browser
+    7. `GET /student/sessions/{id}/result` — fetch the assessment result
+
+    ## Socket.io Events
+    Connect with the JWT token as a query param: `ws://server/api/v1?token=<jwt>`
+
+    | Direction        | Event                 | Payload                                      |
+    |------------------|-----------------------|----------------------------------------------|
+    | client → server  | `join_session`        | `{ session_id: string }`                     |
+    | server → client  | `assessment.complete` | `{ session_id: string, overall_score: float }`|
+    | server → client  | `assessment.failed`   | `{ session_id: string, reason: string }`     |
+
+servers:
+  - url: http://localhost:4000/api/v1
+    description: Local development
+  - url: http://your-school-server/api/v1
+    description: School production server (self-hosted)
+
+tags:
+  - name: Auth
+    description: Registration, login, token refresh, logout
+  - name: Admin — Classes
+    description: Create and manage school classes (grade levels)
+  - name: Admin — Sections
+    description: Create and manage sections within a class
+  - name: Admin — Users
+    description: View all users, assign roles, activate/deactivate
+  - name: Admin — Teacher Assignments
+    description: Assign teachers to one or more sections
+  - name: Admin — Student Assignments
+    description: Assign each student to exactly one section; move between sections
+  - name: Admin — Dashboard
+    description: School-wide summary statistics
+  - name: Teacher — Sections
+    description: View all sections assigned to the logged-in teacher
+  - name: Teacher — Lessons
+    description: Upload, manage, and reorder PDF lessons per section
+  - name: Teacher — Dashboard
+    description: Section analytics, per-student progress, leaderboard
+  - name: Student — Lessons
+    description: Browse published lessons and access PDF viewer
+  - name: Student — Sessions
+    description: Start reading sessions, submit audio, retrieve AI assessment results
+  - name: Student — Dashboard
+    description: Personal progress, streak counter, leaderboard, skill profile
+
+security:
+  - bearerAuth: []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPONENTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT access token obtained from POST /auth/login
+
+  # ── Reusable Parameters ───────────────────────────────────────────────────
+
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      description: Page number (1-indexed)
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+
+    LimitParam:
+      name: limit
+      in: query
+      description: Results per page
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+    ClassIdParam:
+      name: classId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    SectionIdParam:
+      name: sectionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    LessonIdParam:
+      name: lessonId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    UserIdParam:
+      name: userId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    SessionIdParam:
+      name: sessionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    StudentIdParam:
+      name: studentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    AssignmentIdParam:
+      name: assignmentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  # ── Reusable Schemas ──────────────────────────────────────────────────────
+
+  schemas:
+
+    # ── Primitives & Enums ────────────────────────────────────────────────
+
+    UUID:
+      type: string
+      format: uuid
+      example: "550e8400-e29b-41d4-a716-446655440000"
+
+    Timestamp:
+      type: string
+      format: date-time
+      example: "2026-05-30T08:30:00Z"
+
+    Language:
+      type: string
+      enum: [english, tamil]
+      example: english
+
+    UserRole:
+      type: string
+      enum: [admin, teacher, student]
+      example: student
+
+    SessionStatus:
+      type: string
+      enum: [in_progress, completed, abandoned]
+      example: completed
+
+    AssessmentStatus:
+      type: string
+      enum: [pending, processing, completed, failed]
+      example: completed
+
+    PdfExtractionStatus:
+      type: string
+      enum: [pending, success, failed]
+      example: success
+
+    CompletionStatus:
+      type: string
+      enum: [not_started, in_progress, completed]
+      example: completed
+
+    # ── Shared Structures ─────────────────────────────────────────────────
+
+    Pagination:
+      type: object
+      required: [total, page, limit, total_pages]
+      properties:
+        total:
+          type: integer
+          example: 150
+        page:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 20
+        total_pages:
+          type: integer
+          example: 8
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: NOT_FOUND
+        message:
+          type: string
+          example: Resource not found
+        details:
+          type: object
+          additionalProperties: true
+          nullable: true
+
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          example: email
+        message:
+          type: string
+          example: must be a valid email address
+
+    ValidationError:
+      type: object
+      required: [code, message, errors]
+      properties:
+        code:
+          type: string
+          example: VALIDATION_ERROR
+        message:
+          type: string
+          example: Request validation failed
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    # ── Auth Schemas ──────────────────────────────────────────────────────
+
+    RegisterRequest:
+      type: object
+      required: [full_name, email, password, role]
+      properties:
+        full_name:
+          type: string
+          minLength: 2
+          maxLength: 255
+          example: Priya Sharma
+        email:
+          type: string
+          format: email
+          example: priya@school.edu
+        password:
+          type: string
+          minLength: 8
+          maxLength: 72
+          example: SecurePass@123
+          description: Minimum 8 characters; stored as bcrypt hash
+        role:
+          type: string
+          enum: [student, teacher]
+          example: student
+          description: Choose your account type. Admin accounts are provisioned separately.
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          example: admin@school.edu
+        password:
+          type: string
+          example: SecurePass@123
+
+    AuthTokens:
+      type: object
+      required: [access_token, refresh_token, expires_in]
+      properties:
+        access_token:
+          type: string
+          description: JWT; expires in 15 minutes
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        refresh_token:
+          type: string
+          description: Opaque token; expires in 7 days
+          example: dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4...
+        expires_in:
+          type: integer
+          description: Access token TTL in seconds
+          example: 900
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          example: dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4...
+
+    # ── User Schemas ──────────────────────────────────────────────────────
+
+    UserProfile:
+      type: object
+      required: [id, full_name, email, role, is_active, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        full_name:
+          type: string
+          example: Priya Sharma
+        email:
+          type: string
+          example: priya@school.edu
+        role:
+          $ref: '#/components/schemas/UserRole'
+        is_active:
+          type: boolean
+          example: true
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    AuthResponse:
+      allOf:
+        - $ref: '#/components/schemas/AuthTokens'
+        - type: object
+          required: [user]
+          properties:
+            user:
+              $ref: '#/components/schemas/UserProfile'
+
+    AdminUserView:
+      type: object
+      required: [id, full_name, email, role, is_active, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        full_name:
+          type: string
+          example: Ravi Kumar
+        email:
+          type: string
+          example: ravi@school.edu
+        role:
+          $ref: '#/components/schemas/UserRole'
+        is_active:
+          type: boolean
+          example: true
+        assigned_section:
+          description: Populated only when role = student
+          nullable: true
+          type: object
+          properties:
+            section_id:
+              $ref: '#/components/schemas/UUID'
+            section_name:
+              type: string
+              example: Section B
+            class_name:
+              type: string
+              example: Grade 4
+        assigned_sections:
+          description: Populated only when role = teacher
+          nullable: true
+          type: array
+          items:
+            type: object
+            properties:
+              section_id:
+                $ref: '#/components/schemas/UUID'
+              section_name:
+                type: string
+                example: Section A
+              class_name:
+                type: string
+                example: Grade 5
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    # ── Class Schemas ─────────────────────────────────────────────────────
+
+    Class:
+      type: object
+      required: [id, name, is_active, section_count, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        name:
+          type: string
+          example: Grade 5
+        is_active:
+          type: boolean
+          example: true
+        section_count:
+          type: integer
+          example: 3
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    CreateClassRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: Grade 5
+
+    UpdateClassRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: Grade 5 (Revised)
+
+    # ── Section Schemas ───────────────────────────────────────────────────
+
+    Section:
+      type: object
+      required: [id, class_id, class_name, name, is_active, student_count, teacher_count, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        class_id:
+          $ref: '#/components/schemas/UUID'
+        class_name:
+          type: string
+          example: Grade 5
+        name:
+          type: string
+          example: Section A
+        is_active:
+          type: boolean
+          example: true
+        student_count:
+          type: integer
+          example: 32
+        teacher_count:
+          type: integer
+          example: 2
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    CreateSectionRequest:
+      type: object
+      required: [class_id, name]
+      properties:
+        class_id:
+          $ref: '#/components/schemas/UUID'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: Section A
+
+    UpdateSectionRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: Section A (Revised)
+
+    # ── Assignment Schemas ────────────────────────────────────────────────
+
+    TeacherAssignment:
+      type: object
+      required: [id, teacher_id, teacher_name, teacher_email, section_id, section_name, class_name, is_active, assigned_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        teacher_id:
+          $ref: '#/components/schemas/UUID'
+        teacher_name:
+          type: string
+          example: Mrs. Anitha
+        teacher_email:
+          type: string
+          example: anitha@school.edu
+        section_id:
+          $ref: '#/components/schemas/UUID'
+        section_name:
+          type: string
+          example: Section A
+        class_name:
+          type: string
+          example: Grade 5
+        assigned_by_name:
+          type: string
+          example: Admin
+        is_active:
+          type: boolean
+          example: true
+        assigned_at:
+          $ref: '#/components/schemas/Timestamp'
+        unassigned_at:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+
+    CreateTeacherAssignmentRequest:
+      type: object
+      required: [teacher_id, section_id]
+      properties:
+        teacher_id:
+          $ref: '#/components/schemas/UUID'
+        section_id:
+          $ref: '#/components/schemas/UUID'
+
+    StudentAssignment:
+      type: object
+      required: [id, student_id, student_name, student_email, section_id, section_name, class_name, is_active, assigned_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        student_id:
+          $ref: '#/components/schemas/UUID'
+        student_name:
+          type: string
+          example: Arun Prakash
+        student_email:
+          type: string
+          example: arun@school.edu
+        section_id:
+          $ref: '#/components/schemas/UUID'
+        section_name:
+          type: string
+          example: Section B
+        class_name:
+          type: string
+          example: Grade 5
+        assigned_by_name:
+          type: string
+          example: Admin
+        is_active:
+          type: boolean
+          example: true
+        assigned_at:
+          $ref: '#/components/schemas/Timestamp'
+        unassigned_at:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+
+    CreateStudentAssignmentRequest:
+      type: object
+      required: [student_id, section_id]
+      properties:
+        student_id:
+          $ref: '#/components/schemas/UUID'
+        section_id:
+          $ref: '#/components/schemas/UUID'
+
+    MoveStudentRequest:
+      type: object
+      required: [new_section_id]
+      properties:
+        new_section_id:
+          $ref: '#/components/schemas/UUID'
+
+    # ── Lesson Schemas ────────────────────────────────────────────────────
+
+    Lesson:
+      type: object
+      required: [id, section_id, uploaded_by_id, uploaded_by_name, title, language,
+                 pdf_extraction_status, display_order, is_published, created_at, updated_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        section_id:
+          $ref: '#/components/schemas/UUID'
+        uploaded_by_id:
+          $ref: '#/components/schemas/UUID'
+        uploaded_by_name:
+          type: string
+          example: Mrs. Anitha
+        title:
+          type: string
+          example: Chapter 3 - The Water Cycle
+        description:
+          type: string
+          nullable: true
+          example: Reading comprehension on the water cycle
+        language:
+          $ref: '#/components/schemas/Language'
+        pdf_extraction_status:
+          $ref: '#/components/schemas/PdfExtractionStatus'
+        display_order:
+          type: integer
+          example: 3
+        is_published:
+          type: boolean
+          example: true
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    LessonWithStats:
+      allOf:
+        - $ref: '#/components/schemas/Lesson'
+        - type: object
+          properties:
+            attempt_count:
+              type: integer
+              description: Total reading sessions by all students
+              example: 47
+            avg_score:
+              type: number
+              format: float
+              nullable: true
+              description: Average overall_score across all student sessions
+              example: 76.3
+
+    LessonWithStudentProgress:
+      allOf:
+        - $ref: '#/components/schemas/Lesson'
+        - type: object
+          required: [my_best_score, my_attempt_count, completion_status]
+          properties:
+            my_best_score:
+              type: number
+              format: float
+              nullable: true
+              description: Student's highest overall_score across all attempts
+              example: 85.5
+            my_attempt_count:
+              type: integer
+              example: 2
+            completion_status:
+              $ref: '#/components/schemas/CompletionStatus'
+
+    UpdateLessonRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+          example: Chapter 3 - The Water Cycle (Revised)
+        description:
+          type: string
+          nullable: true
+        language:
+          $ref: '#/components/schemas/Language'
+        is_published:
+          type: boolean
+          example: true
+
+    ReorderLessonsRequest:
+      type: object
+      required: [order]
+      properties:
+        order:
+          type: array
+          description: Full list of lesson UUIDs in the desired display order. Must include all lesson IDs for the section.
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/UUID'
+          example:
+            - "550e8400-e29b-41d4-a716-446655440001"
+            - "550e8400-e29b-41d4-a716-446655440002"
+            - "550e8400-e29b-41d4-a716-446655440003"
+
+    PdfUrlResponse:
+      type: object
+      required: [url, expires_at]
+      properties:
+        url:
+          type: string
+          description: MinIO presigned URL valid for 15 minutes
+          example: http://school-server/storage/lessons/uuid.pdf?X-Amz-Signature=abc123
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    # ── Reading Session Schemas ────────────────────────────────────────────
+
+    ReadingSession:
+      type: object
+      required: [id, student_id, lesson_id, lesson_title, attempt_number,
+                 status, language, assessment_status, started_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        student_id:
+          $ref: '#/components/schemas/UUID'
+        lesson_id:
+          $ref: '#/components/schemas/UUID'
+        lesson_title:
+          type: string
+          example: Chapter 3 - The Water Cycle
+        attempt_number:
+          type: integer
+          example: 2
+        status:
+          $ref: '#/components/schemas/SessionStatus'
+        language:
+          $ref: '#/components/schemas/Language'
+        assessment_status:
+          $ref: '#/components/schemas/AssessmentStatus'
+        duration_seconds:
+          type: integer
+          nullable: true
+          example: 187
+        started_at:
+          $ref: '#/components/schemas/Timestamp'
+        completed_at:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+
+    StartSessionRequest:
+      type: object
+      required: [lesson_id, language]
+      properties:
+        lesson_id:
+          $ref: '#/components/schemas/UUID'
+        language:
+          $ref: '#/components/schemas/Language'
+          description: Language the student will read in. Must match lesson language.
+
+    # ── Assessment Result Schemas ─────────────────────────────────────────
+
+    PronunciationIssue:
+      type: object
+      required: [word, issue]
+      properties:
+        word:
+          type: string
+          example: phenomenon
+        issue:
+          type: string
+          example: "Second syllable omitted — said 'fenomenon'"
+
+    GrammaticalMistake:
+      type: object
+      required: [original, spoken, type]
+      properties:
+        original:
+          type: string
+          description: Exact phrase from the PDF
+          example: The cats run fast
+        spoken:
+          type: string
+          description: What the student said
+          example: The cat run fast
+        type:
+          type: string
+          enum: [omission, substitution, insertion, repetition]
+          example: substitution
+
+    AssessmentResult:
+      type: object
+      required:
+        - id
+        - session_id
+        - accuracy_score
+        - fluency_score
+        - pronunciation_score
+        - overall_score
+        - words_per_minute
+        - pause_count
+        - filler_word_count
+        - mispronounced_words
+        - pronunciation_issues
+        - grammatical_mistakes
+        - strength_tags
+        - weakness_tags
+        - summary
+        - assessed_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UUID'
+        session_id:
+          $ref: '#/components/schemas/UUID'
+        accuracy_score:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          example: 87.5
+          description: Percentage of words read correctly vs PDF text
+        fluency_score:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          example: 74.0
+          description: Based on WPM, pause frequency, and hesitations
+        pronunciation_score:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          example: 69.5
+          description: Phoneme-level error inferred from transcript mismatches
+        overall_score:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          example: 78.2
+          description: "Weighted composite: accuracy×0.40 + fluency×0.30 + pronunciation×0.30"
+        words_per_minute:
+          type: integer
+          example: 95
+        pause_count:
+          type: integer
+          example: 7
+        filler_word_count:
+          type: integer
+          example: 3
+          description: Count of filler words like 'um', 'uh', 'er'
+        mispronounced_words:
+          type: array
+          items:
+            type: string
+          example: ["phenomenon", "archipelago"]
+        pronunciation_issues:
+          type: array
+          items:
+            $ref: '#/components/schemas/PronunciationIssue'
+        grammatical_mistakes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GrammaticalMistake'
+        strength_tags:
+          type: array
+          items:
+            type: string
+          example: ["vocabulary", "sentence_completion", "reading_pace"]
+        weakness_tags:
+          type: array
+          items:
+            type: string
+          example: ["pronunciation", "filler_words"]
+        summary:
+          type: string
+          example: "Good overall reading with clear articulation of most words. Focus on multi-syllabic words and reducing filler sounds like 'um' and 'uh'."
+        assessed_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    # ── Dashboard Schemas ─────────────────────────────────────────────────
+
+    StreakInfo:
+      type: object
+      required: [current_streak, longest_streak]
+      properties:
+        current_streak:
+          type: integer
+          example: 7
+          description: Consecutive days with at least one completed session
+        longest_streak:
+          type: integer
+          example: 14
+        last_session_date:
+          type: string
+          format: date
+          nullable: true
+          example: "2026-05-30"
+
+    LeaderboardEntry:
+      type: object
+      required: [rank, student_id, student_name, composite_score, sessions_completed, avg_overall_score, is_current_user]
+      properties:
+        rank:
+          type: integer
+          example: 3
+        student_id:
+          $ref: '#/components/schemas/UUID'
+        student_name:
+          type: string
+          example: Arun Prakash
+        composite_score:
+          type: number
+          format: float
+          example: 92.4
+          description: "Weighted rank score: avg_overall_score×0.50 + activity_bonus×0.30 + avg_accuracy×0.20"
+        sessions_completed:
+          type: integer
+          example: 6
+          description: Reading sessions completed this week
+        avg_overall_score:
+          type: number
+          format: float
+          example: 88.5
+        is_current_user:
+          type: boolean
+          example: false
+
+    SkillTrend:
+      type: object
+      required: [date, accuracy_score, fluency_score, pronunciation_score, overall_score]
+      properties:
+        date:
+          type: string
+          format: date
+          example: "2026-05-30"
+        accuracy_score:
+          type: number
+          format: float
+          example: 87.5
+        fluency_score:
+          type: number
+          format: float
+          example: 74.0
+        pronunciation_score:
+          type: number
+          format: float
+          example: 69.5
+        overall_score:
+          type: number
+          format: float
+          example: 78.2
+
+    NextLesson:
+      type: object
+      required: [lesson_id, title, language]
+      properties:
+        lesson_id:
+          $ref: '#/components/schemas/UUID'
+        title:
+          type: string
+          example: Chapter 4 - Ecosystems
+        language:
+          $ref: '#/components/schemas/Language'
+        estimated_minutes:
+          type: integer
+          nullable: true
+          example: 5
+        my_best_score:
+          type: number
+          format: float
+          nullable: true
+          example: null
+
+    RecentSession:
+      type: object
+      required: [session_id, lesson_id, lesson_title, overall_score, attempt_number, completed_at]
+      properties:
+        session_id:
+          $ref: '#/components/schemas/UUID'
+        lesson_id:
+          $ref: '#/components/schemas/UUID'
+        lesson_title:
+          type: string
+          example: Chapter 3 - The Water Cycle
+        overall_score:
+          type: number
+          format: float
+          nullable: true
+          example: 78.2
+        attempt_number:
+          type: integer
+          example: 2
+        completed_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    StudentSkillProfile:
+      type: object
+      required:
+        - avg_accuracy_score
+        - avg_fluency_score
+        - avg_pronunciation_score
+        - avg_overall_score
+        - strength_tags
+        - weakness_tags
+      properties:
+        avg_accuracy_score:
+          type: number
+          format: float
+          example: 84.2
+        avg_fluency_score:
+          type: number
+          format: float
+          example: 71.5
+        avg_pronunciation_score:
+          type: number
+          format: float
+          example: 68.9
+        avg_overall_score:
+          type: number
+          format: float
+          example: 75.8
+        strength_tags:
+          type: array
+          items:
+            type: string
+          example: ["vocabulary", "sentence_completion"]
+        weakness_tags:
+          type: array
+          items:
+            type: string
+          example: ["pronunciation", "fluency"]
+
+    StudentDashboard:
+      type: object
+      required: [student, streak, progress, skill_profile, recent_sessions]
+      properties:
+        student:
+          type: object
+          required: [id, full_name, section_name, class_name]
+          properties:
+            id:
+              $ref: '#/components/schemas/UUID'
+            full_name:
+              type: string
+              example: Arun Prakash
+            section_name:
+              type: string
+              example: Section A
+            class_name:
+              type: string
+              example: Grade 5
+        streak:
+          $ref: '#/components/schemas/StreakInfo'
+        current_rank:
+          type: integer
+          nullable: true
+          example: 3
+          description: Current week leaderboard rank within section
+        progress:
+          type: object
+          required: [overall_progress_percent, lessons_completed, total_lessons, total_sessions]
+          properties:
+            overall_progress_percent:
+              type: number
+              format: float
+              example: 60.0
+              description: "(lessons with ≥1 completed session / total published lessons) × 100"
+            lessons_completed:
+              type: integer
+              example: 6
+            total_lessons:
+              type: integer
+              example: 10
+            total_sessions:
+              type: integer
+              example: 14
+        skill_profile:
+          $ref: '#/components/schemas/StudentSkillProfile'
+        recent_sessions:
+          type: array
+          maxItems: 5
+          items:
+            $ref: '#/components/schemas/RecentSession'
+        next_lesson:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/NextLesson'
+
+    StudentProgressRow:
+      type: object
+      required: [student_id, student_name, lessons_completed, total_sessions, current_streak]
+      properties:
+        student_id:
+          $ref: '#/components/schemas/UUID'
+        student_name:
+          type: string
+          example: Arun Prakash
+        lessons_completed:
+          type: integer
+          example: 6
+        total_sessions:
+          type: integer
+          example: 14
+        avg_overall_score:
+          type: number
+          format: float
+          nullable: true
+          example: 78.2
+        avg_accuracy_score:
+          type: number
+          format: float
+          nullable: true
+          example: 84.2
+        avg_fluency_score:
+          type: number
+          format: float
+          nullable: true
+          example: 71.5
+        current_streak:
+          type: integer
+          example: 7
+        last_session_date:
+          type: string
+          format: date
+          nullable: true
+          example: "2026-05-30"
+        current_rank:
+          type: integer
+          nullable: true
+          example: 3
+
+    StudentProgressDetail:
+      type: object
+      required: [student, skill_profile, skill_trend, session_history]
+      properties:
+        student:
+          type: object
+          required: [id, full_name, email]
+          properties:
+            id:
+              $ref: '#/components/schemas/UUID'
+            full_name:
+              type: string
+              example: Arun Prakash
+            email:
+              type: string
+              example: arun@school.edu
+        skill_profile:
+          $ref: '#/components/schemas/StudentSkillProfile'
+        skill_trend:
+          type: array
+          description: One data point per session, up to the requested number of days
+          items:
+            $ref: '#/components/schemas/SkillTrend'
+        session_history:
+          type: array
+          items:
+            type: object
+            required: [session_id, lesson_title, attempt_number, completed_at]
+            properties:
+              session_id:
+                $ref: '#/components/schemas/UUID'
+              lesson_id:
+                $ref: '#/components/schemas/UUID'
+              lesson_title:
+                type: string
+                example: Chapter 3 - The Water Cycle
+              attempt_number:
+                type: integer
+                example: 2
+              overall_score:
+                type: number
+                format: float
+                nullable: true
+                example: 78.2
+              accuracy_score:
+                type: number
+                format: float
+                nullable: true
+                example: 84.5
+              fluency_score:
+                type: number
+                format: float
+                nullable: true
+                example: 71.0
+              pronunciation_score:
+                type: number
+                format: float
+                nullable: true
+                example: 68.5
+              duration_seconds:
+                type: integer
+                nullable: true
+                example: 187
+              completed_at:
+                $ref: '#/components/schemas/Timestamp'
+
+    TeacherSectionDashboard:
+      type: object
+      required: [section, summary, top_leaderboard]
+      properties:
+        section:
+          type: object
+          required: [id, name, class_name]
+          properties:
+            id:
+              $ref: '#/components/schemas/UUID'
+            name:
+              type: string
+              example: Section A
+            class_name:
+              type: string
+              example: Grade 5
+        summary:
+          type: object
+          required:
+            - total_students
+            - active_students_last_7_days
+            - avg_overall_score
+            - total_sessions_this_week
+            - lessons_published
+          properties:
+            total_students:
+              type: integer
+              example: 32
+            active_students_last_7_days:
+              type: integer
+              example: 24
+            avg_overall_score:
+              type: number
+              format: float
+              nullable: true
+              example: 76.4
+            avg_overall_score_prev_week:
+              type: number
+              format: float
+              nullable: true
+              example: 72.1
+              description: Previous ISO week average for delta display
+            avg_accuracy_score:
+              type: number
+              format: float
+              nullable: true
+              example: 83.2
+            avg_fluency_score:
+              type: number
+              format: float
+              nullable: true
+              example: 70.5
+            total_sessions_this_week:
+              type: integer
+              example: 87
+            lessons_published:
+              type: integer
+              example: 8
+        top_leaderboard:
+          type: array
+          maxItems: 5
+          items:
+            $ref: '#/components/schemas/LeaderboardEntry'
+
+    AdminDashboard:
+      type: object
+      required: [summary, weekly_activity, unassigned_users]
+      properties:
+        summary:
+          type: object
+          required:
+            - total_classes
+            - total_sections
+            - total_teachers
+            - total_students
+            - unassigned_teachers
+            - unassigned_students
+          properties:
+            total_classes:
+              type: integer
+              example: 10
+            total_sections:
+              type: integer
+              example: 30
+            total_teachers:
+              type: integer
+              example: 45
+            total_students:
+              type: integer
+              example: 900
+            unassigned_teachers:
+              type: integer
+              example: 3
+              description: Teachers with no section assignment
+            unassigned_students:
+              type: integer
+              example: 5
+              description: Students with no section assignment
+        weekly_activity:
+          type: object
+          required: [lessons_uploaded, reading_sessions_completed, active_students]
+          properties:
+            lessons_uploaded:
+              type: integer
+              example: 12
+            reading_sessions_completed:
+              type: integer
+              example: 340
+            active_students:
+              type: integer
+              example: 278
+        unassigned_users:
+          type: array
+          description: Users who registered but have no role or section yet
+          items:
+            type: object
+            required: [id, full_name, email, role, created_at]
+            properties:
+              id:
+                $ref: '#/components/schemas/UUID'
+              full_name:
+                type: string
+                example: New User
+              email:
+                type: string
+                example: newuser@school.edu
+              role:
+                $ref: '#/components/schemas/UserRole'
+              created_at:
+                $ref: '#/components/schemas/Timestamp'
+
+    WeeklyLeaderboard:
+      type: object
+      required: [section_name, week_start, week_end, entries]
+      properties:
+        section_name:
+          type: string
+          example: Grade 5 - Section A
+        week_start:
+          type: string
+          format: date
+          example: "2026-05-25"
+        week_end:
+          type: string
+          format: date
+          example: "2026-05-31"
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/LeaderboardEntry'
+
+    StudentWeeklyLeaderboard:
+      allOf:
+        - $ref: '#/components/schemas/WeeklyLeaderboard'
+        - type: object
+          properties:
+            my_rank:
+              type: integer
+              nullable: true
+              example: 7
+              description: Current user's rank; null if no sessions this week
+
+  # ── Reusable Responses ────────────────────────────────────────────────────
+
+  responses:
+
+    Unauthorized:
+      description: Missing or invalid JWT token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: UNAUTHORIZED
+            message: Invalid or expired token
+
+    Forbidden:
+      description: Authenticated but insufficient role permissions
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: FORBIDDEN
+            message: You do not have permission to access this resource
+
+    NotFound:
+      description: Requested resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: NOT_FOUND
+            message: Resource not found
+
+    Conflict:
+      description: Resource already exists or business rule violated
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: CONFLICT
+            message: A section named 'Section A' already exists in Grade 5
+
+    UnprocessableEntity:
+      description: Request body or query parameters failed schema validation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationError'
+
+    InternalServerError:
+      description: Unexpected server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: INTERNAL_ERROR
+            message: An unexpected error occurred
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────────────────────────────────────
+
+paths:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # AUTH
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new user account
+      description: |
+        Creates an account with the specified role (student or teacher). The account
+        is inactive until an admin approves it. An admin must also assign a section
+        before the user can access role-specific features.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            example:
+              full_name: Priya Sharma
+              email: priya@school.edu
+              password: SecurePass@123
+              role: student
+      responses:
+        '201':
+          description: Account created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message, user_id]
+                properties:
+                  message:
+                    type: string
+                    example: Account created. Awaiting admin approval before you can log in.
+                  user_id:
+                    $ref: '#/components/schemas/UUID'
+        '409':
+          description: Email is already registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: EMAIL_TAKEN
+                message: An account with this email already exists
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login and receive JWT access + refresh tokens
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: admin@school.edu
+              password: SecurePass@123
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          description: Invalid credentials or inactive account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalid_credentials:
+                  summary: Wrong email or password
+                  value:
+                    code: INVALID_CREDENTIALS
+                    message: Email or password is incorrect
+                inactive:
+                  summary: Account pending approval or deactivated
+                  value:
+                    code: ACCOUNT_INACTIVE
+                    message: Account pending admin approval. Contact your admin.
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          description: Too many failed login attempts (5 per 15 minutes per IP)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: RATE_LIMITED
+                message: Too many login attempts. Try again in 15 minutes.
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Exchange a refresh token for a new access token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: New access token issued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, expires_in]
+                properties:
+                  access_token:
+                    type: string
+                    example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                  expires_in:
+                    type: integer
+                    example: 900
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout and revoke the refresh token
+      description: Access token expires naturally after 15 minutes; the refresh token is immediately invalidated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '204':
+          description: Logged out successfully
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get the currently authenticated user's profile
+      responses:
+        '200':
+          description: Authenticated user's profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ADMIN — CLASSES
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /admin/classes:
+    get:
+      tags: [Admin — Classes]
+      summary: List all classes
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: include_inactive
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Paginated class list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Class'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags: [Admin — Classes]
+      summary: Create a new class
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateClassRequest'
+            example:
+              name: Grade 5
+      responses:
+        '201':
+          description: Class created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Class'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /admin/classes/{classId}:
+    get:
+      tags: [Admin — Classes]
+      summary: Get a single class with its sections
+      parameters:
+        - $ref: '#/components/parameters/ClassIdParam'
+      responses:
+        '200':
+          description: Class detail with sections
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Class'
+                  - type: object
+                    properties:
+                      sections:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Section'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [Admin — Classes]
+      summary: Rename a class
+      parameters:
+        - $ref: '#/components/parameters/ClassIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClassRequest'
+      responses:
+        '200':
+          description: Class updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Class'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /admin/classes/{classId}/status:
+    patch:
+      tags: [Admin — Classes]
+      summary: Activate or deactivate a class
+      parameters:
+        - $ref: '#/components/parameters/ClassIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [is_active]
+              properties:
+                is_active:
+                  type: boolean
+                  example: false
+      responses:
+        '200':
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Class'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ADMIN — SECTIONS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /admin/sections:
+    get:
+      tags: [Admin — Sections]
+      summary: List all sections, optionally filtered by class
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: class_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: include_inactive
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Paginated section list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Section'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags: [Admin — Sections]
+      summary: Create a new section inside a class
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSectionRequest'
+            example:
+              class_id: "550e8400-e29b-41d4-a716-446655440000"
+              name: Section A
+      responses:
+        '201':
+          description: Section created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Section'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /admin/sections/{sectionId}:
+    get:
+      tags: [Admin — Sections]
+      summary: Get a section with its assigned teachers and students
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+      responses:
+        '200':
+          description: Section detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Section'
+                  - type: object
+                    properties:
+                      teachers:
+                        type: array
+                        items:
+                          type: object
+                          required: [teacher_id, teacher_name, assigned_at]
+                          properties:
+                            teacher_id:
+                              $ref: '#/components/schemas/UUID'
+                            teacher_name:
+                              type: string
+                              example: Mrs. Anitha
+                            assigned_at:
+                              $ref: '#/components/schemas/Timestamp'
+                      students:
+                        type: array
+                        items:
+                          type: object
+                          required: [student_id, student_name, assigned_at]
+                          properties:
+                            student_id:
+                              $ref: '#/components/schemas/UUID'
+                            student_name:
+                              type: string
+                              example: Arun Prakash
+                            assigned_at:
+                              $ref: '#/components/schemas/Timestamp'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [Admin — Sections]
+      summary: Rename a section
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSectionRequest'
+      responses:
+        '200':
+          description: Section renamed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Section'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/sections/{sectionId}/status:
+    patch:
+      tags: [Admin — Sections]
+      summary: Activate or deactivate a section
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [is_active]
+              properties:
+                is_active:
+                  type: boolean
+                  example: false
+      responses:
+        '200':
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Section'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ADMIN — USERS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /admin/users:
+    get:
+      tags: [Admin — Users]
+      summary: List all registered users
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: role
+          in: query
+          description: Filter by role
+          schema:
+            $ref: '#/components/schemas/UserRole'
+        - name: is_active
+          in: query
+          schema:
+            type: boolean
+        - name: unassigned
+          in: query
+          description: If true, return only users without a section assignment
+          schema:
+            type: boolean
+        - name: search
+          in: query
+          description: Partial match on name or email
+          schema:
+            type: string
+            example: priya
+      responses:
+        '200':
+          description: Paginated user list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdminUserView'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/users/{userId}:
+    get:
+      tags: [Admin — Users]
+      summary: Get a single user's full profile
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      responses:
+        '200':
+          description: User detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/users/{userId}/role:
+    patch:
+      tags: [Admin — Users]
+      summary: Assign or change a user's role
+      description: Cannot be used to assign or change the admin role.
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role:
+                  type: string
+                  enum: [teacher, student]
+                  example: student
+      responses:
+        '200':
+          description: Role updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserView'
+        '400':
+          description: Cannot modify admin role
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_OPERATION
+                message: Admin role cannot be changed via this endpoint
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/users/{userId}/status:
+    patch:
+      tags: [Admin — Users]
+      summary: Activate or deactivate a user account
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [is_active]
+              properties:
+                is_active:
+                  type: boolean
+                  example: false
+      responses:
+        '200':
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserView'
+        '400':
+          description: Cannot deactivate own admin account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_OPERATION
+                message: You cannot deactivate your own account
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ADMIN — TEACHER ASSIGNMENTS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /admin/assignments/teachers:
+    get:
+      tags: [Admin — Teacher Assignments]
+      summary: List teacher-section assignments
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: teacher_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: section_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: is_active
+          in: query
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: Paginated assignment list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TeacherAssignment'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags: [Admin — Teacher Assignments]
+      summary: Assign a teacher to a section
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTeacherAssignmentRequest'
+            example:
+              teacher_id: "550e8400-e29b-41d4-a716-446655440001"
+              section_id: "550e8400-e29b-41d4-a716-446655440002"
+      responses:
+        '201':
+          description: Assignment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TeacherAssignment'
+        '400':
+          description: Specified user is not a teacher
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_ROLE
+                message: The specified user does not have the teacher role
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Teacher is already actively assigned to this section
+          $ref: '#/components/responses/Conflict'
+
+  /admin/assignments/teachers/{assignmentId}:
+    delete:
+      tags: [Admin — Teacher Assignments]
+      summary: Remove a teacher from a section
+      description: Sets the assignment's is_active = false. Assignment history is preserved.
+      parameters:
+        - $ref: '#/components/parameters/AssignmentIdParam'
+      responses:
+        '204':
+          description: Teacher removed from section
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ADMIN — STUDENT ASSIGNMENTS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /admin/assignments/students:
+    get:
+      tags: [Admin — Student Assignments]
+      summary: List student-section assignments
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: section_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: is_active
+          in: query
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: Paginated assignment list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/StudentAssignment'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags: [Admin — Student Assignments]
+      summary: Assign a student to a section
+      description: A student can only have one active section assignment. Returns 409 if already assigned.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateStudentAssignmentRequest'
+            example:
+              student_id: "550e8400-e29b-41d4-a716-446655440003"
+              section_id: "550e8400-e29b-41d4-a716-446655440002"
+      responses:
+        '201':
+          description: Student assigned to section
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StudentAssignment'
+        '400':
+          description: Specified user is not a student
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_ROLE
+                message: The specified user does not have the student role
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Student is already assigned to a section
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: ALREADY_ASSIGNED
+                message: "Student is already assigned to Grade 5 - Section A. Use PUT /admin/assignments/students/{studentId}/move to reassign."
+
+  /admin/assignments/students/{studentId}/move:
+    put:
+      tags: [Admin — Student Assignments]
+      summary: Move a student to a different section
+      description: |
+        Deactivates the current section assignment and creates a new one.
+        The old assignment row is preserved as history (is_active=false, unassigned_at set).
+      parameters:
+        - $ref: '#/components/parameters/StudentIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MoveStudentRequest'
+            example:
+              new_section_id: "550e8400-e29b-41d4-a716-446655440005"
+      responses:
+        '200':
+          description: Student moved to new section
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StudentAssignment'
+        '400':
+          description: Student is not currently assigned to any section
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: NOT_ASSIGNED
+                message: This student has no active section assignment
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Student is already in the target section
+          $ref: '#/components/responses/Conflict'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ADMIN — DASHBOARD
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /admin/dashboard:
+    get:
+      tags: [Admin — Dashboard]
+      summary: Get school-wide summary and pending action items
+      responses:
+        '200':
+          description: Admin dashboard data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminDashboard'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TEACHER — SECTIONS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /teacher/sections:
+    get:
+      tags: [Teacher — Sections]
+      summary: Get all sections assigned to the authenticated teacher
+      responses:
+        '200':
+          description: Teacher's assigned sections
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/Section'
+                        - type: object
+                          properties:
+                            lesson_count:
+                              type: integer
+                              example: 8
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TEACHER — LESSONS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /teacher/sections/{sectionId}/lessons:
+    get:
+      tags: [Teacher — Lessons]
+      summary: List all lessons in a section (teacher view with stats)
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+        - name: is_published
+          in: query
+          description: Filter by published state
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Lessons ordered by display_order, with section-wide attempt stats
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LessonWithStats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Section not found or not assigned to this teacher
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      tags: [Teacher — Lessons]
+      summary: Upload a new PDF lesson to a section
+      description: |
+        Accepts multipart/form-data. The PDF is stored in MinIO.
+        Text extraction from the PDF runs asynchronously — `pdf_extraction_status`
+        will be `pending` initially and update to `success` or `failed`.
+        Students cannot start sessions on a lesson until extraction is `success`.
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [title, language, pdf]
+              properties:
+                title:
+                  type: string
+                  maxLength: 500
+                  example: Chapter 3 - The Water Cycle
+                description:
+                  type: string
+                  maxLength: 2000
+                  example: Reading comprehension exercise on the water cycle
+                language:
+                  $ref: '#/components/schemas/Language'
+                is_published:
+                  type: boolean
+                  default: false
+                  description: If false, students cannot see the lesson yet
+                pdf:
+                  type: string
+                  format: binary
+                  description: PDF file only; max 50 MB
+      responses:
+        '201':
+          description: Lesson record created; PDF text extraction queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Lesson'
+        '400':
+          description: File is not a PDF or exceeds 50 MB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_FILE
+                message: Only PDF files up to 50 MB are accepted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /teacher/sections/{sectionId}/lessons/reorder:
+    put:
+      tags: [Teacher — Lessons]
+      summary: Set the display order of lessons in a section
+      description: The request body must contain ALL lesson IDs for the section.
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReorderLessonsRequest'
+      responses:
+        '200':
+          description: Display order updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Lessons reordered successfully
+        '400':
+          description: Provided IDs do not match the full set of lessons in this section
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INCOMPLETE_LIST
+                message: The order array must contain all 8 lesson IDs for this section
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /teacher/sections/{sectionId}/lessons/{lessonId}:
+    get:
+      tags: [Teacher — Lessons]
+      summary: Get a single lesson
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+        - $ref: '#/components/parameters/LessonIdParam'
+      responses:
+        '200':
+          description: Lesson detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LessonWithStats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [Teacher — Lessons]
+      summary: Update lesson metadata
+      description: Updates title, description, language, or published state. Does not replace the PDF file.
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+        - $ref: '#/components/parameters/LessonIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateLessonRequest'
+      responses:
+        '200':
+          description: Lesson updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Lesson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [Teacher — Lessons]
+      summary: Delete a lesson and its PDF from storage
+      description: |
+        Hard-deletes the lesson record and removes the PDF from MinIO.
+        If completed student sessions exist, the server returns **409** and requires
+        `?force=true` to acknowledge that session history will also be deleted.
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+        - $ref: '#/components/parameters/LessonIdParam'
+        - name: force
+          in: query
+          description: Set to true to confirm deletion when student session history exists
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '204':
+          description: Lesson and PDF deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Student session history exists; pass force=true to confirm
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: HAS_STUDENT_DATA
+                message: "14 student sessions exist for this lesson. Add ?force=true to delete anyway."
+
+  /teacher/sections/{sectionId}/lessons/{lessonId}/pdf-url:
+    get:
+      tags: [Teacher — Lessons]
+      summary: Get a presigned URL to view the lesson PDF (15-minute expiry)
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+        - $ref: '#/components/parameters/LessonIdParam'
+      responses:
+        '200':
+          description: Presigned MinIO URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PdfUrlResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # TEACHER — DASHBOARD
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /teacher/sections/{sectionId}/dashboard:
+    get:
+      tags: [Teacher — Dashboard]
+      summary: Get section-level dashboard summary and top leaderboard
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+      responses:
+        '200':
+          description: Section dashboard
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TeacherSectionDashboard'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /teacher/sections/{sectionId}/students:
+    get:
+      tags: [Teacher — Dashboard]
+      summary: Get the progress table for all students in a section
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: sort_by
+          in: query
+          schema:
+            type: string
+            enum: [name, avg_overall_score, lessons_completed, current_streak, last_session_date]
+            default: avg_overall_score
+        - name: sort_order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+        - name: search
+          in: query
+          description: Partial match on student name
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Student progress rows
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, pagination]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/StudentProgressRow'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /teacher/sections/{sectionId}/students/{studentId}/progress:
+    get:
+      tags: [Teacher — Dashboard]
+      summary: Drilldown — full progress detail for one student
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+        - $ref: '#/components/parameters/StudentIdParam'
+        - name: days
+          in: query
+          description: Days of history for skill trend chart (7-90)
+          schema:
+            type: integer
+            minimum: 7
+            maximum: 90
+            default: 30
+      responses:
+        '200':
+          description: Student progress detail with session history and skill trend
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StudentProgressDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Section or student not found, or student not in this section
+          $ref: '#/components/responses/NotFound'
+
+  /teacher/sections/{sectionId}/leaderboard:
+    get:
+      tags: [Teacher — Dashboard]
+      summary: Get the weekly leaderboard for a section
+      parameters:
+        - $ref: '#/components/parameters/SectionIdParam'
+        - name: week_start
+          in: query
+          description: "ISO Monday date to view (default: current week)"
+          schema:
+            type: string
+            format: date
+            example: "2026-05-25"
+      responses:
+        '200':
+          description: Weekly leaderboard
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WeeklyLeaderboard'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STUDENT — LESSONS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /student/lessons:
+    get:
+      tags: [Student — Lessons]
+      summary: List all published lessons in the student's section
+      parameters:
+        - name: status
+          in: query
+          description: Filter by the student's completion status
+          schema:
+            $ref: '#/components/schemas/CompletionStatus'
+      responses:
+        '200':
+          description: Published lessons with student's personal progress overlay
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [section_name, data]
+                properties:
+                  section_name:
+                    type: string
+                    example: Grade 5 - Section A
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LessonWithStudentProgress'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '412':
+          description: Student has not been assigned to a section yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: NOT_ASSIGNED
+                message: You have not been assigned to a section yet. Contact your admin.
+
+  /student/lessons/{lessonId}:
+    get:
+      tags: [Student — Lessons]
+      summary: Get a single lesson with the student's attempt history
+      parameters:
+        - $ref: '#/components/parameters/LessonIdParam'
+      responses:
+        '200':
+          description: Lesson with past attempts
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/LessonWithStudentProgress'
+                  - type: object
+                    properties:
+                      attempts:
+                        type: array
+                        items:
+                          type: object
+                          required: [session_id, attempt_number, overall_score, completed_at]
+                          properties:
+                            session_id:
+                              $ref: '#/components/schemas/UUID'
+                            attempt_number:
+                              type: integer
+                              example: 2
+                            overall_score:
+                              type: number
+                              format: float
+                              nullable: true
+                              example: 78.2
+                            completed_at:
+                              $ref: '#/components/schemas/Timestamp'
+                              nullable: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /student/lessons/{lessonId}/pdf-url:
+    get:
+      tags: [Student — Lessons]
+      summary: Get a presigned URL to view the lesson PDF (15-minute expiry)
+      description: Pass this URL to react-pdf in the browser. The PDF is never downloaded — it is rendered in-browser only.
+      parameters:
+        - $ref: '#/components/parameters/LessonIdParam'
+      responses:
+        '200':
+          description: Presigned MinIO URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PdfUrlResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: PDF text extraction failed; lesson cannot be viewed until teacher re-uploads
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: PDF_EXTRACTION_FAILED
+                message: This lesson could not be processed. Your teacher has been notified.
+
+  /student/lessons/{lessonId}/sessions:
+    get:
+      tags: [Student — Sessions]
+      summary: List all of the student's past reading sessions for a lesson
+      parameters:
+        - $ref: '#/components/parameters/LessonIdParam'
+      responses:
+        '200':
+          description: All attempts for this lesson, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lesson_id, lesson_title, data]
+                properties:
+                  lesson_id:
+                    $ref: '#/components/schemas/UUID'
+                  lesson_title:
+                    type: string
+                    example: Chapter 3 - The Water Cycle
+                  data:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/ReadingSession'
+                        - type: object
+                          properties:
+                            overall_score:
+                              type: number
+                              format: float
+                              nullable: true
+                              example: 78.2
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STUDENT — SESSIONS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /student/sessions:
+    post:
+      tags: [Student — Sessions]
+      summary: Start a new reading session
+      description: |
+        Creates a session record with status `in_progress` and `assessment_status = pending`.
+        The client should then record the student's audio using the browser MediaRecorder API
+        and call `POST /student/sessions/{sessionId}/submit` when reading is complete.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartSessionRequest'
+            example:
+              lesson_id: "550e8400-e29b-41d4-a716-446655440010"
+              language: english
+      responses:
+        '201':
+          description: Session started
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, attempt_number, started_at]
+                properties:
+                  session_id:
+                    $ref: '#/components/schemas/UUID'
+                  attempt_number:
+                    type: integer
+                    example: 3
+                    description: How many times this student has attempted this lesson
+                  started_at:
+                    $ref: '#/components/schemas/Timestamp'
+        '400':
+          description: Lesson not published, not in student's section, or PDF not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                not_published:
+                  value:
+                    code: LESSON_NOT_AVAILABLE
+                    message: This lesson has not been published yet
+                extraction_pending:
+                  value:
+                    code: LESSON_NOT_READY
+                    message: This lesson is still being processed. Try again in a moment.
+                wrong_section:
+                  value:
+                    code: ACCESS_DENIED
+                    message: This lesson does not belong to your section
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Lesson not found
+          $ref: '#/components/responses/NotFound'
+
+  /student/sessions/{sessionId}:
+    get:
+      tags: [Student — Sessions]
+      summary: Get session status
+      description: |
+        Poll this endpoint to check `assessment_status`.
+        Alternatively, listen for the `assessment.complete` Socket.io event.
+      parameters:
+        - $ref: '#/components/parameters/SessionIdParam'
+      responses:
+        '200':
+          description: Session record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadingSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /student/sessions/{sessionId}/submit:
+    post:
+      tags: [Student — Sessions]
+      summary: Submit the audio recording for a session
+      description: |
+        Accepts the WebM/OGG audio file from MediaRecorder.
+        The server:
+        1. Streams audio to the Whisper STT microservice (never written to disk)
+        2. Discards the audio buffer immediately after transcription
+        3. Queues a BullMQ job to assess the transcript via Ollama
+        4. Returns 202 immediately; emits `assessment.complete` via Socket.io when done
+
+        Maximum audio file size: **50 MB** (~90 minutes at standard WebM bitrate).
+      parameters:
+        - $ref: '#/components/parameters/SessionIdParam'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [audio]
+              properties:
+                audio:
+                  type: string
+                  format: binary
+                  description: Audio in WebM or OGG format from browser MediaRecorder API
+                duration_seconds:
+                  type: integer
+                  description: Recording duration in seconds
+                  example: 187
+      responses:
+        '202':
+          description: Audio received; assessment queued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, assessment_status, message]
+                properties:
+                  session_id:
+                    $ref: '#/components/schemas/UUID'
+                  assessment_status:
+                    type: string
+                    example: processing
+                  message:
+                    type: string
+                    example: Your reading is being assessed. You will be notified when ready.
+        '400':
+          description: Session is not in_progress, or audio is missing/invalid format
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                not_in_progress:
+                  value:
+                    code: INVALID_SESSION_STATE
+                    message: Session is not in_progress. It may have already been submitted or abandoned.
+                invalid_format:
+                  value:
+                    code: INVALID_FILE
+                    message: Audio must be in WebM or OGG format
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          description: Audio file exceeds 50 MB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: FILE_TOO_LARGE
+                message: Audio file must be under 50 MB
+
+  /student/sessions/{sessionId}/abandon:
+    patch:
+      tags: [Student — Sessions]
+      summary: Abandon an in-progress session without submitting audio
+      description: Marks the session as `abandoned`. No assessment is run. Student may start a fresh attempt anytime.
+      parameters:
+        - $ref: '#/components/parameters/SessionIdParam'
+      responses:
+        '200':
+          description: Session abandoned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session_id, status]
+                properties:
+                  session_id:
+                    $ref: '#/components/schemas/UUID'
+                  status:
+                    type: string
+                    example: abandoned
+        '400':
+          description: Session is not in_progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_SESSION_STATE
+                message: Only in_progress sessions can be abandoned
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /student/sessions/{sessionId}/result:
+    get:
+      tags: [Student — Sessions]
+      summary: Get the AI assessment result for a completed session
+      description: |
+        Returns the full assessment result once `assessment_status = completed`.
+        Returns **202** if assessment is still processing.
+        Returns **424** if assessment permanently failed after all retries.
+      parameters:
+        - $ref: '#/components/parameters/SessionIdParam'
+      responses:
+        '200':
+          description: Assessment complete
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session, result]
+                properties:
+                  session:
+                    $ref: '#/components/schemas/ReadingSession'
+                  result:
+                    $ref: '#/components/schemas/AssessmentResult'
+        '202':
+          description: Assessment is still processing
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [assessment_status, message]
+                properties:
+                  assessment_status:
+                    type: string
+                    example: processing
+                  message:
+                    type: string
+                    example: Assessment is in progress. Please wait or listen for the Socket.io notification.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '424':
+          description: Assessment failed after 3 retries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: ASSESSMENT_FAILED
+                message: Assessment could not be completed. Please try a new reading session.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # STUDENT — DASHBOARD
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  /student/dashboard:
+    get:
+      tags: [Student — Dashboard]
+      summary: Get the student's full dashboard
+      description: |
+        Returns streak, current rank, overall progress, skill profile,
+        5 most recent sessions, and the next recommended lesson.
+        All data is scoped to the student's active section.
+      responses:
+        '200':
+          description: Student dashboard
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StudentDashboard'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '412':
+          description: Student has not been assigned to a section yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: NOT_ASSIGNED
+                message: You have not been assigned to a section yet.
+
+  /student/leaderboard:
+    get:
+      tags: [Student — Dashboard]
+      summary: Get the weekly leaderboard for the student's section
+      description: |
+        Returns all entries for the requested ISO week.
+        `is_current_user: true` marks the authenticated student's row.
+        `my_rank` is also returned at the top level for students outside the top 10.
+        Leaderboard resets each Monday at 00:00 server time.
+      parameters:
+        - name: week_start
+          in: query
+          description: "ISO Monday date (default: current week's Monday)"
+          schema:
+            type: string
+            format: date
+            example: "2026-05-25"
+      responses:
+        '200':
+          description: Weekly leaderboard
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StudentWeeklyLeaderboard'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '412':
+          description: Student has not been assigned to a section yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: NOT_ASSIGNED
+                message: You have not been assigned to a section yet.
+
+  /student/progress:
+    get:
+      tags: [Student — Dashboard]
+      summary: Get skill trend data points for dashboard charts
+      description: |
+        Returns one data point per completed session within the requested time window.
+        Use this for the line charts on the student dashboard (accuracy, fluency, pronunciation over time).
+      parameters:
+        - name: days
+          in: query
+          description: Number of past days to include (7-90)
+          schema:
+            type: integer
+            minimum: 7
+            maximum: 90
+            default: 30
+      responses:
+        '200':
+          description: Skill trend data and improvement summary
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [trend, summary]
+                properties:
+                  trend:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SkillTrend'
+                  summary:
+                    type: object
+                    required: [best_overall_score]
+                    properties:
+                      best_overall_score:
+                        type: number
+                        format: float
+                        nullable: true
+                        example: 91.0
+                      most_improved_skill:
+                        type: string
+                        nullable: true
+                        example: fluency
+                        description: Skill with the largest positive delta over the period
+                      most_improved_delta:
+                        type: number
+                        format: float
+                        nullable: true
+                        example: 12.5
+                        description: Score improvement (last session minus first session in window)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '412':
+          description: Student has not been assigned to a section yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: NOT_ASSIGNED
+                message: You have not been assigned to a section yet.

@@ -1,0 +1,14 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+python-multipart==0.0.9
+pydantic-settings==2.3.4
+faster-whisper==1.1.1
+# faster-whisper's deps installed explicitly so we can override av==11.* pin.
+# av>=12.0.0 ships pre-built manylinux wheels — no compilation needed.
+av>=12.0.0
+ctranslate2>=4.0,<5.0
+huggingface-hub>=0.13.0
+tokenizers>=0.13.0
+onnxruntime>=1.14.0
+tqdm>=4.0
+requests>=2.31.0
