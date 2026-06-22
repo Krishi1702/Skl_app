@@ -86,7 +86,7 @@ async def submit_session(
     # Transcribe immediately — audio bytes are never written to storage or Redis
     from app.services.assessment_service import transcribe_audio
     try:
-        transcript = await transcribe_audio(audio_bytes, session.language)
+        transcription = await transcribe_audio(audio_bytes, session.language)
     except Exception:
         raise HTTPException(
             status_code=502,
@@ -102,12 +102,19 @@ async def submit_session(
     session.completed_at = now
     await db.flush()
 
-    # Enqueue only the lightweight transcript string — no audio bytes in Redis
+    # Enqueue transcript + Whisper timing data so the worker can compute
+    # WPM and pauses deterministically (never estimated by the LLM).
     from app.core.config import settings
     from arq import create_pool
     from arq.connections import RedisSettings
     pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
-    await pool.enqueue_job("run_assessment", str(sessionId), transcript)
+    await pool.enqueue_job(
+        "run_assessment",
+        str(sessionId),
+        transcription["transcript"],
+        transcription.get("word_timestamps", []),
+        float(transcription.get("duration", 0)),
+    )
     await pool.aclose()
 
     return {

@@ -34,8 +34,8 @@ redis[hiredis]==5.0.4
 # PDF text extraction
 pypdf==4.2.0
 
-# TTS for AI reference reading — Indian English via Google (co.in accent)
-gTTS==2.5.3
+# TTS — Microsoft Edge Neural TTS (no system deps, async-native, MP3 output)
+edge-tts==7.2.8
 
 # Linting / formatting (dev)
 ruff==0.4.7

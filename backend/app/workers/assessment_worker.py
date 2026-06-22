@@ -31,18 +31,27 @@ async def extract_pdf_text(ctx, lesson_id: str, pdf_bytes: bytes) -> None:
         await db.commit()
 
 
-async def run_assessment(ctx, session_id: str, transcript: str) -> None:
+async def run_assessment(
+    ctx,
+    session_id: str,
+    transcript: str,
+    word_timestamps: list | None = None,
+    duration: float = 0.0,
+) -> None:
     """
     Assessment pipeline (STT is done in the API layer before this job is queued):
-    1. Assess transcript via Ollama LLM
-    2. Save result → update skill profile, streak, leaderboard
-    3. Notify student via Redis pub/sub
+    1. Compute WPM / pauses / fillers from Whisper timing data (deterministic)
+    2. Score accuracy / fluency / pronunciation via Ollama LLM
+    3. Save result → update skill profile, streak, leaderboard
+    4. Notify student via Redis pub/sub
     """
     from app.db.session import AsyncSessionLocal
     from app.models.reading_session import ReadingSession, AssessmentStatus
     from app.models.assessment_result import AssessmentResult
-    from app.services.assessment_service import assess_reading
+    from app.services.assessment_service import assess_reading, compute_reading_metrics
     from app.services.notification_service import publish_assessment_complete, publish_assessment_failed
+
+    word_timestamps = word_timestamps or []
 
     async with AsyncSessionLocal() as db:
         session = await db.get(ReadingSession, UUID(session_id))
@@ -57,8 +66,17 @@ async def run_assessment(ctx, session_id: str, transcript: str) -> None:
             lesson = await db.get(Lesson, session.lesson_id)
             pdf_text = lesson.pdf_extracted_text or ""
 
-            # Step 2: LLM Assessment
-            logger.info(f"Running LLM assessment for session {session_id}")
+            # Step 2: Deterministic metrics from Whisper timing data.
+            # Use session.duration_seconds as fallback when Whisper duration is unavailable.
+            effective_duration = duration if duration > 0 else float(session.duration_seconds or 0)
+            metrics = compute_reading_metrics(word_timestamps, effective_duration, transcript)
+            logger.info(
+                "Session %s metrics — WPM: %d, pauses: %d, fillers: %d",
+                session_id, metrics["words_per_minute"], metrics["pause_count"], metrics["filler_word_count"],
+            )
+
+            # Step 3: LLM Assessment (accuracy / fluency / pronunciation only)
+            logger.info("Running LLM assessment for session %s", session_id)
             assessment_data = await assess_reading(pdf_text, transcript, session.language)
 
             # Step 4: Persist result
@@ -68,9 +86,9 @@ async def run_assessment(ctx, session_id: str, transcript: str) -> None:
                 fluency_score=assessment_data["fluency_score"],
                 pronunciation_score=assessment_data["pronunciation_score"],
                 overall_score=assessment_data["overall_score"],
-                words_per_minute=int(assessment_data.get("words_per_minute", 0)),
-                pause_count=int(assessment_data.get("pause_count", 0)),
-                filler_word_count=int(assessment_data.get("filler_word_count", 0)),
+                words_per_minute=metrics["words_per_minute"],
+                pause_count=metrics["pause_count"],
+                filler_word_count=metrics["filler_word_count"],
                 mispronounced_words=assessment_data.get("mispronounced_words", []),
                 pronunciation_issues=assessment_data.get("pronunciation_issues", []),
                 grammatical_mistakes=assessment_data.get("grammatical_mistakes", []),
