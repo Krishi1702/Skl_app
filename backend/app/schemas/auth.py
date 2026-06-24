@@ -33,13 +33,17 @@ class RegisterOut(BaseModel):
 
 
 class LoginIn(BaseModel):
-    email: EmailStr
+    email: str  # accepts bare username OR a full email address
     password: str
 
     @field_validator("email")
     @classmethod
-    def lowercase_email(cls, v: str) -> str:
-        return v.lower()
+    def normalize_login(cls, v: str) -> str:
+        v = v.strip().lower()
+        # Plain username (no @) → resolve to the school.local domain used during import
+        if "@" not in v:
+            v = f"{v}@school.local"
+        return v
 
 
 class TokenOut(BaseModel):

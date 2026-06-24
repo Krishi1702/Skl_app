@@ -17,7 +17,7 @@ import { AlertCircle, FileSpreadsheet, MoreHorizontal, PowerOff, Upload } from "
 import { format } from "date-fns";
 
 export default function StudentsPage() {
-  const { data, isLoading, isError } = useUsers({ role: "student" });
+  const { data, isLoading, isError } = useUsers({ role: "student", limit: 100 });
   const toggleStatus = useToggleUserStatus();
   const importUsers = useImportUsers();
 

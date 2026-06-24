@@ -10,7 +10,7 @@ import { api, extractApiError } from "@/lib/api";
 import { useAuthStore } from "@/store/auth.store";
 
 const schema = z.object({
-  email: z.string().email("Enter a valid email"),
+  email: z.string().min(1, "Username or email is required"),
   password: z.string().min(1, "Password is required"),
 });
 
@@ -87,12 +87,13 @@ export default function LoginPage() {
 
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div>
-            <label className="block text-sm font-medium mb-1">Email</label>
+            <label className="block text-sm font-medium mb-1">Username or Email</label>
             <input
               {...register("email")}
-              type="email"
+              type="text"
+              autoComplete="username"
               className="w-full border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-primary"
-              placeholder="you@school.edu"
+              placeholder="username or you@school.edu"
             />
             {errors.email && (
               <p className="text-red-500 text-xs mt-1">{errors.email.message}</p>

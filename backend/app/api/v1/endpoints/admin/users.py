@@ -158,7 +158,7 @@ async def import_users(
             errors.append({"row": idx, "error": "Missing required fields (Name, Email/Username, Password, Class, Section)"})
             continue
 
-        email = username if "@" in username else f"{username}@school.local"
+        email = (username if "@" in username else f"{username}@school.local").lower()
 
         cls = (await db.execute(
             select(SchoolClass).where(func.lower(SchoolClass.name) == class_name.lower())
