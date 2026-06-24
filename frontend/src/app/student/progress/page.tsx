@@ -101,8 +101,15 @@ export default function StudentProgressPage() {
                       {progress.summary.most_improved_skill ?? "–"}
                     </p>
                     {progress.summary.most_improved_delta !== null && (
-                      <Badge className="mt-1 text-xs bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300">
-                        +{Number(progress.summary.most_improved_delta).toFixed(1)} pts
+                      <Badge
+                        className={`mt-1 text-xs ${
+                          progress.summary.most_improved_delta >= 0
+                            ? "bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300"
+                            : "bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300"
+                        }`}
+                      >
+                        {progress.summary.most_improved_delta >= 0 ? "+" : ""}
+                        {Number(progress.summary.most_improved_delta).toFixed(1)} pts
                       </Badge>
                     )}
                   </div>

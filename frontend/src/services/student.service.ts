@@ -15,6 +15,7 @@ import type {
   StudentWeeklyLeaderboard,
   StudentProgressResponse,
   AssessmentResult,
+  StudentAchievements,
 } from "@/types/api";
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
@@ -82,6 +83,11 @@ export async function getStudentProgress(days?: number): Promise<StudentProgress
   const res = await apiClient.get<StudentProgressResponse>("/student/progress", {
     params: days !== undefined ? { days } : undefined,
   });
+  return res.data;
+}
+
+export async function getStudentAchievements(): Promise<StudentAchievements> {
+  const res = await apiClient.get<StudentAchievements>("/student/achievements");
   return res.data;
 }
 

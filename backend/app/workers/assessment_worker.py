@@ -141,6 +141,20 @@ async def _update_analytics(student_id: UUID, lesson_id: UUID, assessment_data: 
 
         now = datetime.now(timezone.utc)
 
+        # Count how many distinct lessons this student has now completed
+        from app.models.reading_session import ReadingSession, SessionStatus, AssessmentStatus
+        from app.models.assessment_result import AssessmentResult as AR
+        from sqlalchemy import select as _sel, func as _func
+        distinct_lessons = (await db.execute(
+            _sel(_func.count(_func.distinct(ReadingSession.lesson_id)))
+            .join(AR, AR.session_id == ReadingSession.id)
+            .where(
+                ReadingSession.student_id == student_id,
+                ReadingSession.status == SessionStatus.completed,
+                ReadingSession.assessment_status == AssessmentStatus.completed,
+            )
+        )).scalar_one() or 0
+
         if not profile:
             profile = StudentSkillProfile(
                 student_id=student_id,
@@ -149,7 +163,7 @@ async def _update_analytics(student_id: UUID, lesson_id: UUID, assessment_data: 
                 avg_pronunciation_score=pronunciation,
                 avg_overall_score=overall,
                 total_sessions_completed=1,
-                total_lessons_completed=1,
+                total_lessons_completed=distinct_lessons,
                 strength_tags=assessment_data.get("strength_tags", []),
                 weakness_tags=assessment_data.get("weakness_tags", []),
                 last_updated_at=now,
@@ -162,6 +176,7 @@ async def _update_analytics(student_id: UUID, lesson_id: UUID, assessment_data: 
             profile.avg_pronunciation_score = (float(profile.avg_pronunciation_score) * n + pronunciation) / (n + 1)
             profile.avg_overall_score = (float(profile.avg_overall_score) * n + overall) / (n + 1)
             profile.total_sessions_completed += 1
+            profile.total_lessons_completed = distinct_lessons
             profile.strength_tags = assessment_data.get("strength_tags", profile.strength_tags)
             profile.weakness_tags = assessment_data.get("weakness_tags", profile.weakness_tags)
             profile.last_updated_at = now

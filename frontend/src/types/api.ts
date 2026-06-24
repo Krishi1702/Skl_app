@@ -293,3 +293,21 @@ export interface StudentProgressResponse {
     most_improved_delta: number | null;
   };
 }
+
+export interface Achievement {
+  id: string;
+  title: string;
+  description: string;
+  category: "streak" | "sessions" | "lessons" | "score" | "skill";
+  icon: string;
+  earned: boolean;
+  progress: number;
+  target: number;
+}
+
+export interface StudentAchievements {
+  total_earned: number;
+  total_available: number;
+  earned: Achievement[];
+  locked: Achievement[];
+}

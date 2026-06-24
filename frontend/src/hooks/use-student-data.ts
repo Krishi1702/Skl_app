@@ -11,6 +11,7 @@ export const STUDENT_KEYS = {
   lessonSessions: (lessonId: string) => ["student", "lesson-sessions", lessonId] as const,
   leaderboard: (week_start?: string) => ["student", "leaderboard", week_start] as const,
   progress: (days?: number) => ["student", "progress", days] as const,
+  achievements: ["student", "achievements"] as const,
   sessionResult: (sessionId: string) => ["student", "session-result", sessionId] as const,
 } as const;
 
@@ -74,6 +75,13 @@ export function useStudentProgress(days?: number) {
   return useQuery({
     queryKey: STUDENT_KEYS.progress(days),
     queryFn: () => studentService.getStudentProgress(days),
+  });
+}
+
+export function useStudentAchievements() {
+  return useQuery({
+    queryKey: STUDENT_KEYS.achievements,
+    queryFn: studentService.getStudentAchievements,
   });
 }
 
