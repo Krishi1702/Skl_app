@@ -34,6 +34,9 @@ redis[hiredis]==5.0.4
 # PDF text extraction
 pypdf==4.2.0
 
+# Excel parsing (for bulk user import)
+openpyxl==3.1.5
+
 # TTS — Microsoft Edge Neural TTS (no system deps, async-native, MP3 output)
 edge-tts==7.2.8
 

@@ -329,3 +329,26 @@ export function useMoveStudent() {
     },
   });
 }
+
+// ─── Bulk Import ──────────────────────────────────────────────────────────────
+
+export function useImportUsers() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ role, file }: { role: "student" | "teacher"; file: File }) =>
+      adminService.importUsers(role, file),
+    onSuccess: (data) => {
+      if (data.created > 0) {
+        toast.success(`Imported ${data.created} user${data.created !== 1 ? "s" : ""} successfully`);
+      }
+      qc.invalidateQueries({ queryKey: ["admin", "users"] });
+      qc.invalidateQueries({ queryKey: ["admin", "sections"] });
+      qc.invalidateQueries({ queryKey: ADMIN_KEYS.dashboard });
+    },
+    onError: (err: any) => {
+      toast.error(
+        err.response?.data?.detail || err.response?.data?.message || "Import failed"
+      );
+    },
+  });
+}

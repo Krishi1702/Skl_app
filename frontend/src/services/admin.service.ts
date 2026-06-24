@@ -179,3 +179,25 @@ export async function moveStudent(
   );
   return res.data;
 }
+
+// ─── Bulk Import ──────────────────────────────────────────────────────────────
+
+export interface ImportResult {
+  created: number;
+  errors: Array<{ row: number; error: string }>;
+  users: Array<{ name: string; email: string }>;
+}
+
+export async function importUsers(
+  role: "student" | "teacher",
+  file: File
+): Promise<ImportResult> {
+  const formData = new FormData();
+  formData.append("file", file);
+  const res = await apiClient.post<ImportResult>(
+    `/admin/users/import?role=${role}`,
+    formData,
+    { headers: { "Content-Type": "multipart/form-data" } }
+  );
+  return res.data;
+}

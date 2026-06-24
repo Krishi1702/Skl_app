@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { StudentSidebar } from "./student-sidebar";
 import { TopNav } from "./top-nav";
+import { useAuthGuard } from "@/hooks/use-auth-guard";
 
 interface StudentLayoutProps {
   children: React.ReactNode;
@@ -10,6 +11,7 @@ interface StudentLayoutProps {
 
 export function StudentLayout({ children, breadcrumbs }: StudentLayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  useAuthGuard("student");
 
   return (
     <div className="flex h-screen bg-background">

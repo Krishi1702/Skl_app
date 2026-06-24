@@ -16,7 +16,14 @@ export function middleware(request: NextRequest) {
     return NextResponse.redirect(new URL(`/login?next=${pathname}`, request.url));
   }
 
-  return NextResponse.next();
+  // Prevent the browser from caching protected pages.
+  // This stops browsers from serving stale authenticated pages after logout
+  // when the user presses the Back button.
+  const response = NextResponse.next();
+  response.headers.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  response.headers.set("Pragma", "no-cache");
+  response.headers.set("Expires", "0");
+  return response;
 }
 
 export const config = {

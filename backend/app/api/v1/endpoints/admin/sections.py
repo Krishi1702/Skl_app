@@ -6,9 +6,10 @@ from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, select
 
 from app.core.dependencies import AdminUser, DbSession
+from app.models.assignment import StudentSectionAssignment, TeacherSectionAssignment
 from app.models.class_ import SchoolClass
 from app.models.section import Section
-from app.schemas.section import CreateSectionIn, SectionOut, UpdateSectionIn, UpdateStatusIn
+from app.schemas.section import CreateSectionIn, UpdateSectionIn, UpdateStatusIn
 
 router = APIRouter()
 
@@ -24,9 +25,58 @@ async def list_sections(
         stmt = stmt.where(Section.class_id == class_id)
     if not include_inactive:
         stmt = stmt.where(Section.is_active == True)
+
     count = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     sections = list((await db.execute(stmt.offset((page - 1) * limit).limit(limit))).scalars().all())
-    return {"data": sections, "pagination": {"total": count, "page": page, "limit": limit}}
+
+    if not sections:
+        return {"data": [], "pagination": {"total": count, "page": page, "limit": limit}}
+
+    section_ids = [s.id for s in sections]
+    class_ids_uniq = list({s.class_id for s in sections})
+
+    classes = {
+        c.id: c.name
+        for c in (await db.execute(select(SchoolClass).where(SchoolClass.id.in_(class_ids_uniq)))).scalars()
+    }
+
+    student_counts = dict(
+        (await db.execute(
+            select(StudentSectionAssignment.section_id, func.count())
+            .where(
+                StudentSectionAssignment.section_id.in_(section_ids),
+                StudentSectionAssignment.is_active == True,
+            )
+            .group_by(StudentSectionAssignment.section_id)
+        )).all()
+    )
+
+    teacher_counts = dict(
+        (await db.execute(
+            select(TeacherSectionAssignment.section_id, func.count())
+            .where(
+                TeacherSectionAssignment.section_id.in_(section_ids),
+                TeacherSectionAssignment.is_active == True,
+            )
+            .group_by(TeacherSectionAssignment.section_id)
+        )).all()
+    )
+
+    data = [
+        {
+            "id": s.id,
+            "class_id": s.class_id,
+            "class_name": classes.get(s.class_id, ""),
+            "name": s.name,
+            "is_active": s.is_active,
+            "student_count": student_counts.get(s.id, 0),
+            "teacher_count": teacher_counts.get(s.id, 0),
+            "created_at": s.created_at,
+        }
+        for s in sections
+    ]
+
+    return {"data": data, "pagination": {"total": count, "page": page, "limit": limit}}
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

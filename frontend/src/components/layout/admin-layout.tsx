@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { AdminSidebar } from "./admin-sidebar";
 import { TopNav } from "./top-nav";
+import { useAuthGuard } from "@/hooks/use-auth-guard";
 
 interface AdminLayoutProps {
   children: React.ReactNode;
@@ -10,6 +11,7 @@ interface AdminLayoutProps {
 
 export function AdminLayout({ children, breadcrumbs }: AdminLayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  useAuthGuard("admin");
 
   return (
     <div className="flex h-screen bg-background">
