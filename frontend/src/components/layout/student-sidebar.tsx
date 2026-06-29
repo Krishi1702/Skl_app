@@ -7,7 +7,8 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useAuthStore } from "@/store/auth.store";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-
+import schoolLogo from "../../assets/school-logo.jpg";
+import Image from "next/image";
 const navItems = [
   { href: "/student/dashboard", icon: LayoutDashboard, label: "Dashboard" },
   { href: "/student/lessons", icon: BookOpen, label: "Lessons" },
@@ -37,11 +38,17 @@ export function StudentSidebar({ open, onClose }: StudentSidebarProps) {
         open ? "translate-x-0" : "-translate-x-full lg:translate-x-0"
       )}>
         <div className="h-16 flex items-center px-4 border-b gap-3">
-          <div className="h-8 w-8 rounded-lg bg-green-600 flex items-center justify-center">
-            <BookOpen className="h-4 w-4 text-white" />
+          <div className="h-10 w-10 rounded-lg overflow-hidden flex items-center justify-center">
+            <Image
+              src={schoolLogo}
+              alt="School Logo"
+              width={40}
+              height={40}
+              className="h-full w-full object-contain"
+            />
           </div>
           <div className="flex-1 min-w-0">
-            <p className="font-bold text-sm truncate">School ERP</p>
+            <p className="font-bold text-sm truncate">BV Reader AI</p>
             <p className="text-xs text-muted-foreground">Student Portal</p>
           </div>
           <Button variant="ghost" size="icon" className="lg:hidden h-7 w-7" onClick={onClose}>

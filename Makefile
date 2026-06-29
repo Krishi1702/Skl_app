@@ -4,7 +4,7 @@ DOCKER=docker compose
 
 help:
 	@echo ""
-	@echo "  School ERP — Dev Commands"
+	@echo "  BV Reader AI — Dev Commands"
 	@echo "  ─────────────────────────────────"
 	@echo "  up            Start all services (dev)"
 	@echo "  down          Stop all services"

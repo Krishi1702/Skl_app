@@ -44,7 +44,7 @@ export function TeacherSidebar({ open, onClose }: TeacherSidebarProps) {
             <BookOpen className="h-4 w-4 text-white" />
           </div>
           <div className="flex-1 min-w-0">
-            <p className="font-bold text-sm truncate">School ERP</p>
+            <p className="font-bold text-sm truncate">BV Reader AI</p>
             <p className="text-xs text-muted-foreground">Teacher Portal</p>
           </div>
           <Button variant="ghost" size="icon" className="lg:hidden h-7 w-7" onClick={onClose}>

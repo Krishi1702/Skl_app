@@ -19,7 +19,7 @@ export function AdminSidebar() {
   return (
     <aside className="w-56 bg-white border-r flex flex-col">
       <div className="p-4 border-b">
-        <p className="font-bold text-primary text-sm">School ERP</p>
+        <p className="font-bold text-primary text-sm">BV Reader AI</p>
         <p className="text-xs text-gray-500 truncate mt-0.5">{user?.full_name}</p>
       </div>
       <nav className="flex-1 p-3 space-y-1">
