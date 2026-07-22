@@ -160,7 +160,8 @@ jobs:
         # Reports presence/length only. Never prints a secret value.
         run: |
           missing=0
-          check() {
+          # Required: absence fails the job.
+          req() {
             if [ -z "$2" ]; then
               echo "  MISSING  $1"
               missing=1
@@ -168,14 +169,22 @@ jobs:
               echo "  ok       $1  (${#2} chars)"
             fi
           }
+          # Optional: absence is fine — report the fallback and move on.
+          opt() {
+            if [ -z "$2" ]; then
+              echo "  unset    $1  -> using default: $3"
+            else
+              echo "  ok       $1  (${#2} chars)"
+            fi
+          }
           echo "Required:"
-          check SSH_HOST        "${{ secrets.SSH_HOST }}"
-          check SSH_USER        "${{ secrets.SSH_USER }}"
-          check SSH_PRIVATE_KEY "${{ secrets.SSH_PRIVATE_KEY }}"
+          req SSH_HOST        "${{ secrets.SSH_HOST }}"
+          req SSH_USER        "${{ secrets.SSH_USER }}"
+          req SSH_PRIVATE_KEY "${{ secrets.SSH_PRIVATE_KEY }}"
           echo "Optional:"
-          check SSH_PORT        "${{ secrets.SSH_PORT }}"
-          check APP_DIR         "${{ secrets.APP_DIR }}"
-          check SSH_KNOWN_HOSTS "${{ secrets.SSH_KNOWN_HOSTS }}"
+          opt SSH_PORT        "${{ secrets.SSH_PORT }}"        "22"
+          opt APP_DIR         "${{ secrets.APP_DIR }}"         "/opt/skl_app"
+          opt SSH_KNOWN_HOSTS "${{ secrets.SSH_KNOWN_HOSTS }}" "ssh-keyscan (trust on first use)"
           if [ "$missing" = "1" ]; then
             echo "::error::A required secret is empty or not visible to this job."
             echo "This job runs with 'environment: production', so it can read"
