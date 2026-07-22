@@ -159,8 +159,31 @@ jobs:
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_deploy
+          # Strip CR (keys pasted from Windows carry CRLF, which makes OpenSSH
+          # fail with "error in libcrypto") and guarantee a trailing newline,
+          # which OpenSSH also requires after the END line.
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" \
+            | tr -d '\r' \
+            | sed -e '$a\' > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
+
+          # Fail loudly here rather than as an opaque "Permission denied" later.
+          if ! ssh-keygen -y -f ~/.ssh/id_deploy > /dev/null 2>&1; then
+            echo "::error::SSH_PRIVATE_KEY is not a valid OpenSSH private key."
+            echo "Checks:"
+            echo "  1. It must be the PRIVATE key (the file with no .pub), not the public one."
+            echo "  2. Paste the WHOLE file, including the"
+            echo "     -----BEGIN OPENSSH PRIVATE KEY----- and -----END ...----- lines."
+            echo "  3. Generate it with an empty passphrase: ssh-keygen -t ed25519 -N \"\" -f key"
+            echo "     (an encrypted key cannot be used unattended by CI)."
+            echo "Secret currently holds $(wc -l < ~/.ssh/id_deploy) lines; a valid"
+            echo "ed25519 key is ~7 lines and starts with -----BEGIN OPENSSH PRIVATE KEY-----."
+            head -c 40 ~/.ssh/id_deploy | sed 's/^/First 40 chars: /'
+            exit 1
+          fi
+          echo "Private key parsed OK. Public half derived from it:"
+          ssh-keygen -y -f ~/.ssh/id_deploy
+          echo "^ This exact line must be present in ~/.ssh/authorized_keys on the server."
           if [ -n "${{ secrets.SSH_KNOWN_HOSTS }}" ]; then
             # Preferred: pinned host key, immune to MITM on first connect.
             echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
@@ -175,7 +198,12 @@ jobs:
             User $SSH_USER
             Port $SSH_PORT
             IdentityFile ~/.ssh/id_deploy
+            IdentitiesOnly yes
             StrictHostKeyChecking yes
+            # Never fall back to an interactive password prompt — in CI that
+            # just prints "Permission denied, please try again." and stalls.
+            BatchMode yes
+            PreferredAuthentications publickey
           EOF
 
       - name: Ship compose file to server
@@ -219,5 +247,7 @@ jobs:
           ssh target "curl -fsS --retry 5 --retry-delay 5 --retry-all-errors http://localhost/health"
 
       - name: Prune old images
-        if: always()
+        # Only after a successful deploy — running this on a failed run just
+        # produced a second, misleading SSH error.
+        if: success()
         run: ssh target "docker image prune -f --filter 'until=168h'"
