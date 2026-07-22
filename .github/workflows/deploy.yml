@@ -156,6 +156,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Preflight — verify secrets are visible to this job
+        # Reports presence/length only. Never prints a secret value.
+        run: |
+          missing=0
+          check() {
+            if [ -z "$2" ]; then
+              echo "  MISSING  $1"
+              missing=1
+            else
+              echo "  ok       $1  (${#2} chars)"
+            fi
+          }
+          echo "Required:"
+          check SSH_HOST        "${{ secrets.SSH_HOST }}"
+          check SSH_USER        "${{ secrets.SSH_USER }}"
+          check SSH_PRIVATE_KEY "${{ secrets.SSH_PRIVATE_KEY }}"
+          echo "Optional:"
+          check SSH_PORT        "${{ secrets.SSH_PORT }}"
+          check APP_DIR         "${{ secrets.APP_DIR }}"
+          check SSH_KNOWN_HOSTS "${{ secrets.SSH_KNOWN_HOSTS }}"
+          if [ "$missing" = "1" ]; then
+            echo "::error::A required secret is empty or not visible to this job."
+            echo "This job runs with 'environment: production', so it can read"
+            echo "repository secrets AND secrets on the 'production' environment."
+            echo "If a secret looks set in the UI but reads empty here, check:"
+            echo "  - the NAME matches exactly (case-sensitive, no trailing space)"
+            echo "  - it is a SECRET, not a VARIABLE (different tab, vars.* not secrets.*)"
+            echo "  - it is on THIS repo, not a fork or another environment"
+            exit 1
+          fi
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
