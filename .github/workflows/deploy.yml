@@ -1,0 +1,223 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [Phase1]
+  pull_request:
+    branches: [Phase1]
+  workflow_dispatch:
+
+# Never let two deploys touch the server at once. Queue instead of cancelling,
+# so a half-applied deploy is never abandoned mid-flight.
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ── 1. Lint + backend tests ────────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    # Runs inside a container so service containers are reachable by hostname
+    # ("postgres", "redis") — which is exactly what tests/conftest.py hardcodes.
+    container: python:3.11-slim
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: school_erp_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends gcc libpq-dev
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('backend/requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        # Advisory for now: app/ currently has ~267 pre-existing violations
+        # (mostly E501 line-length and I001 import order). Blocking on them would
+        # fail every build. Clear the backlog with `ruff check app/ --fix`, then
+        # drop this line to make lint a real gate.
+        continue-on-error: true
+        run: ruff check app/
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/school_erp_test
+          REDIS_URL: redis://redis:6379
+        run: |
+          # tests/ currently holds only conftest.py — pytest exits 5 ("no tests
+          # collected") which would fail the build. Skip cleanly until real
+          # test files land, then this runs them automatically.
+          if compgen -G "tests/test_*.py" > /dev/null; then
+            pytest tests/ -v --tb=short
+          else
+            echo "::warning::No test files found under backend/tests/ — skipping pytest."
+          fi
+        shell: bash
+
+  # ── 2. Build & push images to GHCR ─────────────────────────────────────────
+  build:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            context: ./backend
+            target: ""
+          - name: frontend
+            context: ./frontend
+            target: runner
+          - name: ai-service
+            context: ./ai-service
+            target: ""
+          - name: nginx
+            context: ./nginx
+            target: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image name
+        id: img
+        run: echo "name=${GITHUB_REPOSITORY,,}/${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          target: ${{ matrix.target }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.img.outputs.name }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ steps.img.outputs.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # ── 3. Deploy to the VPS ───────────────────────────────────────────────────
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/Phase1' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+      APP_DIR: ${{ secrets.APP_DIR || '/opt/skl_app' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          if [ -n "${{ secrets.SSH_KNOWN_HOSTS }}" ]; then
+            # Preferred: pinned host key, immune to MITM on first connect.
+            echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            # Fallback: trust-on-first-use. Set the SSH_KNOWN_HOSTS secret to harden.
+            ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host target
+            HostName $SSH_HOST
+            User $SSH_USER
+            Port $SSH_PORT
+            IdentityFile ~/.ssh/id_deploy
+            StrictHostKeyChecking yes
+          EOF
+
+      - name: Ship compose file to server
+        run: |
+          ssh target "mkdir -p '$APP_DIR'"
+          scp docker-compose.prod.yml target:"$APP_DIR/docker-compose.prod.yml"
+
+      - name: Log the server in to GHCR
+        # Token goes over stdin, never argv — it stays out of the server's process list.
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | ssh target \
+            "docker login ${{ env.REGISTRY }} -u '${{ github.actor }}' --password-stdin"
+
+      - name: Pull and restart
+        run: |
+          ssh target bash -euo pipefail -s <<EOF
+            cd '$APP_DIR'
+            export IMAGE_TAG='${{ github.sha }}'
+            export IMAGE_BASE='${{ env.REGISTRY }}/${GITHUB_REPOSITORY,,}'
+
+            # Persist the tag so a manual 'docker compose up' later reuses this exact build.
+            grep -q '^IMAGE_TAG=' .env && sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=\$IMAGE_TAG|" .env || echo "IMAGE_TAG=\$IMAGE_TAG" >> .env
+            grep -q '^IMAGE_BASE=' .env && sed -i "s|^IMAGE_BASE=.*|IMAGE_BASE=\$IMAGE_BASE|" .env || echo "IMAGE_BASE=\$IMAGE_BASE" >> .env
+
+            docker compose -f docker-compose.prod.yml pull
+            # Migrations run automatically in backend/entrypoint.sh before uvicorn starts.
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans --wait
+          EOF
+
+      - name: Ensure Ollama model is present
+        # Idempotent: a no-op once the model is on the volume.
+        run: |
+          ssh target bash -euo pipefail -s <<EOF
+            cd '$APP_DIR'
+            MODEL=\$(grep -E '^OLLAMA_MODEL=' .env | cut -d= -f2- | tr -d '"' || echo 'llama3.2:1b')
+            docker compose -f docker-compose.prod.yml exec -T ollama ollama pull "\$MODEL"
+          EOF
+
+      - name: Smoke test
+        run: |
+          ssh target "curl -fsS --retry 5 --retry-delay 5 --retry-all-errors http://localhost/health"
+
+      - name: Prune old images
+        if: always()
+        run: ssh target "docker image prune -f --filter 'until=168h'"

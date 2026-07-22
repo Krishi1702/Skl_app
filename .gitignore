@@ -16,9 +16,10 @@ build/
 !.env.example
 !.env.local.example
 
-# Alembic generated revisions (keep .gitkeep)
-backend/alembic/versions/*.py
-!backend/alembic/versions/.gitkeep
+# Alembic revisions MUST be tracked — they are the schema's source of truth.
+# CI builds the backend image from a clean checkout, so an ignored revision
+# means `alembic upgrade head` runs against an empty versions/ dir and silently
+# creates no tables on the server.
 
 # Node
 node_modules/

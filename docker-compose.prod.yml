@@ -1,0 +1,178 @@
+# Production stack — self-contained, no build contexts.
+# The server never needs the source tree: images come from GHCR.
+#
+# Usage on the server:
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# IMAGE_BASE / IMAGE_TAG are written into .env by the deploy workflow.
+
+services:
+
+  # ── Reverse Proxy ──────────────────────────────────────────────────────────
+  nginx:
+    image: ${IMAGE_BASE:-ghcr.io/krishi1702/skl_app}/nginx:${IMAGE_TAG:-latest}
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  # ── Frontend ───────────────────────────────────────────────────────────────
+  frontend:
+    image: ${IMAGE_BASE:-ghcr.io/krishi1702/skl_app}/frontend:${IMAGE_TAG:-latest}
+    environment:
+      NODE_ENV: production
+      # Relative — the browser hits nginx, which routes /api/ to the backend.
+      NEXT_PUBLIC_API_URL: /api/v1
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  # ── Backend API ────────────────────────────────────────────────────────────
+  backend:
+    image: ${IMAGE_BASE:-ghcr.io/krishi1702/skl_app}/backend:${IMAGE_TAG:-latest}
+    env_file: .env
+    # entrypoint.sh runs `alembic upgrade head` here, before uvicorn boots.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  # ── Background Worker (ARQ) ────────────────────────────────────────────────
+  worker:
+    image: ${IMAGE_BASE:-ghcr.io/krishi1702/skl_app}/backend:${IMAGE_TAG:-latest}
+    # Bypasses entrypoint.sh on purpose: if the worker also ran `alembic upgrade
+    # head` it would race the backend for the migration lock on every deploy.
+    # The backend owns migrations; the worker waits for it to finish.
+    entrypoint: ["python", "-m", "app.workers.main"]
+    env_file: .env
+    depends_on:
+      backend:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  # ── Whisper STT Microservice ───────────────────────────────────────────────
+  ai-service:
+    image: ${IMAGE_BASE:-ghcr.io/krishi1702/skl_app}/ai-service:${IMAGE_TAG:-latest}
+    environment:
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-base}
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+    volumes:
+      - whisper_models:/root/.cache/huggingface
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  # ── Ollama LLM ─────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  # ── MinIO (S3-compatible object storage) ───────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    ports:
+      # Bound to loopback — reach the admin console via an SSH tunnel, not the
+      # public internet:  ssh -L 9001:localhost:9001 user@server
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - app_net
+
+networks:
+  app_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  whisper_models:
+  ollama_models:
