@@ -1,0 +1,4 @@
+# Keeps public/ in git.
+# frontend/Dockerfile's runner stage does `COPY --from=builder /app/public ./public`,
+# which fails the production build outright if this directory is absent.
+# Static assets (favicon, images) go here.
