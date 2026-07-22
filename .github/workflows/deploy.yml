@@ -221,9 +221,15 @@ jobs:
             head -c 40 ~/.ssh/id_deploy | sed 's/^/First 40 chars: /'
             exit 1
           fi
-          echo "Private key parsed OK. Public half derived from it:"
+          echo "Private key parsed OK."
+          echo "--- public half derived from SSH_PRIVATE_KEY ---"
           ssh-keygen -y -f ~/.ssh/id_deploy
-          echo "^ This exact line must be present in ~/.ssh/authorized_keys on the server."
+          echo "--- fingerprint ---"
+          ssh-keygen -lf ~/.ssh/id_deploy
+          echo "-----------------------------------------------"
+          echo "That public line must be in ~/.ssh/authorized_keys on the server."
+          echo "Compare fingerprints server-side with:"
+          echo "  ssh-keygen -lf ~/.ssh/authorized_keys"
           if [ -n "${{ secrets.SSH_KNOWN_HOSTS }}" ]; then
             # Preferred: pinned host key, immune to MITM on first connect.
             echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
@@ -245,6 +251,26 @@ jobs:
             BatchMode yes
             PreferredAuthentications publickey
           EOF
+
+      - name: Verify SSH connectivity
+        run: |
+          # -v surfaces which key was offered and how the server answered.
+          if ! ssh -v target "echo connected as \$(whoami) on \$(hostname)" 2>&1 | sed 's/^/  /'; then
+            echo "::error::Server rejected the deploy key."
+            echo "The key is valid locally (previous step parsed it), so this is server-side."
+            echo "On the server, as the ${{ secrets.SSH_USER }} user, check:"
+            echo "  1. The public key printed above is present verbatim:"
+            echo "       grep -c 'ssh-ed25519' ~/.ssh/authorized_keys"
+            echo "     Fingerprints must match: ssh-keygen -lf ~/.ssh/authorized_keys"
+            echo "  2. Permissions — sshd silently ignores authorized_keys otherwise:"
+            echo "       chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
+            echo "       chown -R ${{ secrets.SSH_USER }}:${{ secrets.SSH_USER }} ~/.ssh"
+            echo "  3. The key is on the RIGHT user's account (\$HOME of ${{ secrets.SSH_USER }},"
+            echo "     not root) — this is the most common cause."
+            echo "  4. sshd allows it:  sudo sshd -T | grep -E 'pubkeyauthentication|allowusers'"
+            echo "     then:            sudo tail -50 /var/log/auth.log"
+            exit 1
+          fi
 
       - name: Ship compose file to server
         run: |
