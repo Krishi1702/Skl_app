@@ -13,11 +13,37 @@ services:
     image: ${IMAGE_BASE:-ghcr.io/krishi1702/skl_app}/nginx:${IMAGE_TAG:-latest}
     ports:
       - "80:80"
+      - "443:443"
+    environment:
+      TLS_ENABLED: "true"
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env, e.g. reader.bharathiyavidyalaya.com}
+    volumes:
+      - certbot_conf:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
     depends_on:
       backend:
         condition: service_healthy
       frontend:
         condition: service_started
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  # ── TLS certificate renewal (Let's Encrypt) ────────────────────────────────
+  # Initial issuance is a one-time manual command — see docs/DEPLOYMENT.md.
+  # This container only renews; certbot no-ops until a cert is within 30 days
+  # of expiry, so the 12h loop is cheap.
+  certbot:
+    image: certbot/certbot:latest
+    volumes:
+      - certbot_conf:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    entrypoint: >-
+      /bin/sh -c 'trap exit TERM;
+      while :; do
+        certbot renew --webroot -w /var/www/certbot --quiet;
+        sleep 12h & wait $${!};
+      done'
     restart: unless-stopped
     networks:
       - app_net
@@ -176,3 +202,5 @@ volumes:
   minio_data:
   whisper_models:
   ollama_models:
+  certbot_conf:
+  certbot_www:

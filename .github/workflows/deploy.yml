@@ -352,7 +352,12 @@ jobs:
 
       - name: Smoke test
         run: |
+          # /health deliberately stays on plain HTTP so this probe needs no cert.
           ssh target "curl -fsS --retry 5 --retry-delay 5 --retry-all-errors http://localhost/health"
+          # -k: the certificate is issued for the public domain, not "localhost".
+          ssh target "curl -fsSk --retry 3 --retry-delay 5 https://localhost/health" \
+            && echo "HTTPS listener OK" \
+            || echo "::warning::HTTPS not responding — has the certificate been issued yet?"
 
       - name: Prune old images
         # Only after a successful deploy — running this on a failed run just

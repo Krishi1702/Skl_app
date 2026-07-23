@@ -1,0 +1,102 @@
+# Rendered by docker-entrypoint.d/40-tls.sh when TLS_ENABLED=true.
+# ${DOMAIN} is the only substituted variable — nginx's own $host, $scheme etc.
+# are left untouched.
+
+# ── HTTP :80 — ACME challenge, health probe, redirect everything else ───────
+server {
+    listen 80;
+    server_name _;
+
+    resolver 127.0.0.11 valid=30s ipv6=off;
+
+    # Let's Encrypt webroot challenge MUST stay on plain HTTP and must never
+    # be redirected, or renewal fails.
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        default_type "text/plain";
+    }
+
+    # Health stays on HTTP so container healthchecks and the CI smoke test
+    # don't have to deal with certificates.
+    location /health {
+        set $backend http://backend:8000;
+        proxy_pass $backend/health;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ── HTTPS :443 — the application ───────────────────────────────────────────
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name _;
+
+    resolver 127.0.0.11 valid=30s ipv6=off;
+
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_prefer_server_ciphers off;
+
+    # Allow large uploads (PDF lessons + audio recordings)
+    client_max_body_size 60M;
+
+    gzip on;
+    gzip_types text/plain application/json application/javascript text/css;
+
+    # ── Backend API & WebSocket ─────────────────────────────────────────────
+    location /api/ {
+        set $backend http://backend:8000;
+        proxy_pass         $backend;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        # WebSocket upgrade for /api/v1/ws
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    # ── Health Check ────────────────────────────────────────────────────────
+    location /health {
+        set $backend http://backend:8000;
+        proxy_pass $backend/health;
+    }
+
+    # ── MinIO object storage (presigned PDF / audio URLs) ───────────────────
+    # Host is forwarded unchanged so the S3v4 signature — which covers the Host
+    # header — still validates after the proxy hop.
+    location /lessons/ {
+        set $minio http://minio:9000;
+        proxy_pass         $minio;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        # Stream large files straight through instead of buffering to disk
+        proxy_buffering         off;
+        proxy_request_buffering off;
+    }
+
+    # ── Frontend (Next.js) ──────────────────────────────────────────────────
+    location / {
+        set $frontend http://frontend:3000;
+        proxy_pass         $frontend;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+    }
+}

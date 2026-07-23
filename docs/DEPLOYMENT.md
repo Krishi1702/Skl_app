@@ -130,5 +130,62 @@ it through a tunnel:
 ssh -L 9001:localhost:9001 deploy@your-server
 ```
 
-**TLS** is not configured. nginx serves plain HTTP on `:80`. Add certbot or put
-Cloudflare in front before this handles real student data.
+---
+
+## TLS / HTTPS
+
+nginx listens on both `:80` and `:443`. Port 80 keeps two things un-redirected —
+`/.well-known/acme-challenge/` (renewal breaks otherwise) and `/health` (so probes
+need no certificate) — and 301s everything else to HTTPS.
+
+Certificates live in the `certbot_conf` volume. On startup, if no certificate
+exists for `$DOMAIN`, nginx generates a throwaway **self-signed** one so it can
+bind `:443` at all — certbot can't answer a challenge through an nginx that
+refused to start. Browsers warn until the real certificate replaces it at the
+same path.
+
+### One-time issuance
+
+Requires `DOMAIN` set in `/opt/skl_app/.env`, DNS already pointing at the server,
+and port 443 open.
+
+```bash
+sudo ufw allow 443/tcp        # if ufw is active
+
+cd /opt/skl_app
+docker compose -f docker-compose.prod.yml up -d nginx
+
+docker compose -f docker-compose.prod.yml run --rm certbot \
+  certonly --webroot -w /var/www/certbot \
+  -d reader.bharathiyavidyalaya.com \
+  --email you@example.com --agree-tos --no-eff-email
+
+docker compose -f docker-compose.prod.yml restart nginx
+```
+
+Add `--staging` first if you're unsure — Let's Encrypt rate-limits to 5 failures
+per hostname per hour, and a typo can lock you out for a while. Remove the flag
+and re-run once it succeeds.
+
+### Renewal
+
+The `certbot` service wakes every 12h and renews anything within 30 days of
+expiry. nginx reloads every 6h to pick up new files, so renewal needs no
+intervention. Check status with:
+
+```bash
+docker compose -f docker-compose.prod.yml run --rm certbot certificates
+```
+
+### After issuing
+
+Switch these in `.env` from `http://` to `https://`, then restart the backend:
+
+```
+MINIO_PUBLIC_URL=https://reader.bharathiyavidyalaya.com
+CORS_ORIGINS=["https://reader.bharathiyavidyalaya.com"]
+```
+
+Leave `MINIO_SECURE=false` — that flag governs the *internal* container hop to
+MinIO, which stays plain HTTP inside the Docker network. It is unrelated to the
+browser-facing scheme.
