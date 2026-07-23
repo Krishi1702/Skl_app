@@ -255,7 +255,14 @@ jobs:
       - name: Verify SSH connectivity
         run: |
           # -v surfaces which key was offered and how the server answered.
-          if ! ssh -v target "echo connected as \$(whoami) on \$(hostname)" 2>&1 | sed 's/^/  /'; then
+          # Capture to a file rather than piping: a pipeline returns the LAST
+          # command's status, so `ssh | sed` would mask an ssh failure entirely.
+          set +e
+          ssh -v target "echo connected as \$(whoami) on \$(hostname)" > ssh_out.txt 2>&1
+          rc=$?
+          set -e
+          sed 's/^/  /' ssh_out.txt
+          if [ "$rc" -ne 0 ]; then
             echo "::error::Server rejected the deploy key."
             echo "The key is valid locally (previous step parsed it), so this is server-side."
             echo "On the server, as the ${{ secrets.SSH_USER }} user, check:"
