@@ -15,31 +15,42 @@ if [ -z "${DOMAIN:-}" ]; then
     exit 1
 fi
 
-CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
+LE_DIR="/etc/letsencrypt/live/${DOMAIN}"
+SELF_DIR="/etc/nginx/self-signed/${DOMAIN}"
 
-# Chicken-and-egg: nginx refuses to start with `listen 443 ssl` if the
-# certificate files are missing, but certbot needs a running nginx to answer
-# the ACME challenge. A throwaway self-signed cert breaks the cycle — certbot
-# overwrites it at the same path on first issuance.
-if [ ! -s "${CERT_DIR}/fullchain.pem" ]; then
-    echo "[nginx] No certificate at ${CERT_DIR} — generating a temporary self-signed one."
-    echo "[nginx] Browsers WILL warn until certbot issues the real certificate."
-    mkdir -p "${CERT_DIR}"
-    openssl req -x509 -nodes -newkey rsa:2048 -days 2 \
-        -keyout "${CERT_DIR}/privkey.pem" \
-        -out    "${CERT_DIR}/fullchain.pem" \
-        -subj   "/CN=${DOMAIN}" 2>/dev/null
+# Chicken-and-egg: nginx refuses to start with `listen 443 ssl` when the
+# certificate is missing, but certbot needs a running nginx to answer the ACME
+# challenge. A self-signed cert breaks the cycle.
+#
+# It deliberately lives OUTSIDE /etc/letsencrypt. Certbot refuses to reuse a
+# live/ lineage it did not create and silently issues to "<domain>-0001"
+# instead, which nginx would never read — so it must stay off certbot's turf.
+if [ -s "${LE_DIR}/fullchain.pem" ]; then
+    CERT_DIR="${LE_DIR}"
+    echo "[nginx] Using Let's Encrypt certificate at ${LE_DIR}"
+else
+    CERT_DIR="${SELF_DIR}"
+    echo "[nginx] No Let's Encrypt certificate found for ${DOMAIN}."
+    echo "[nginx] Falling back to a self-signed certificate — browsers WILL warn."
+    echo "[nginx] Issue the real one, then restart nginx (see docs/DEPLOYMENT.md)."
+    if [ ! -s "${SELF_DIR}/fullchain.pem" ]; then
+        mkdir -p "${SELF_DIR}"
+        openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+            -keyout "${SELF_DIR}/privkey.pem" \
+            -out    "${SELF_DIR}/fullchain.pem" \
+            -subj   "/CN=${DOMAIN}" 2>/dev/null
+    fi
 fi
 
 mkdir -p /var/www/certbot
 
-# Substitute ONLY ${DOMAIN}; nginx variables like $host must survive verbatim.
-export DOMAIN
-envsubst '${DOMAIN}' \
+# Substitute ONLY these two; nginx variables like $host must survive verbatim.
+export DOMAIN CERT_DIR
+envsubst '${DOMAIN} ${CERT_DIR}' \
     < /etc/nginx/tls-template/default.conf.template \
     > /etc/nginx/conf.d/default.conf
 
-echo "[nginx] TLS config installed for ${DOMAIN}"
+echo "[nginx] TLS config installed for ${DOMAIN} (cert dir: ${CERT_DIR})"
 
 # Certbot renews in its own container and writes to the shared volume; nginx
 # only picks up the new files on reload.

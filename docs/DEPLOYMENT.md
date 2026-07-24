@@ -138,11 +138,22 @@ nginx listens on both `:80` and `:443`. Port 80 keeps two things un-redirected �
 `/.well-known/acme-challenge/` (renewal breaks otherwise) and `/health` (so probes
 need no certificate) — and 301s everything else to HTTPS.
 
-Certificates live in the `certbot_conf` volume. On startup, if no certificate
-exists for `$DOMAIN`, nginx generates a throwaway **self-signed** one so it can
-bind `:443` at all — certbot can't answer a challenge through an nginx that
-refused to start. Browsers warn until the real certificate replaces it at the
-same path.
+Certificates live in the `certbot_conf` volume. On startup nginx picks its
+certificate this way:
+
+- `/etc/letsencrypt/live/$DOMAIN/` exists → use the real certificate
+- otherwise → generate a **self-signed** one under `/etc/nginx/self-signed/$DOMAIN/`
+  and use that, so `:443` can bind at all (certbot cannot answer a challenge
+  through an nginx that refused to start)
+
+The self-signed cert is deliberately kept **outside** `/etc/letsencrypt`. Certbot
+refuses to reuse a `live/` lineage it did not create — it silently issues to
+`<domain>-0001` instead, which nginx would never read, leaving the untrusted cert
+served forever.
+
+Because the path changes when the real certificate appears, nginx needs a
+`restart` (not a `reload`) after first issuance. Renewals keep the same path, so
+the 6h reload loop handles those unattended.
 
 ### One-time issuance
 
@@ -155,12 +166,25 @@ sudo ufw allow 443/tcp        # if ufw is active
 cd /opt/skl_app
 docker compose -f docker-compose.prod.yml up -d nginx
 
+# Only if an earlier version wrote a self-signed cert into certbot's directory:
+docker compose -f docker-compose.prod.yml run --rm --entrypoint sh certbot -c '
+  rm -rf /etc/letsencrypt/live/reader.bharathiyavidyalaya.com \
+         /etc/letsencrypt/archive/reader.bharathiyavidyalaya.com \
+         /etc/letsencrypt/renewal/reader.bharathiyavidyalaya.com.conf'
+
 docker compose -f docker-compose.prod.yml run --rm certbot \
   certonly --webroot -w /var/www/certbot \
   -d reader.bharathiyavidyalaya.com \
   --email you@example.com --agree-tos --no-eff-email
 
 docker compose -f docker-compose.prod.yml restart nginx
+```
+
+Confirm the result — issuer should read `Let's Encrypt`, not your own domain:
+
+```bash
+echo | openssl s_client -connect reader.bharathiyavidyalaya.com:443 2>/dev/null \
+  | openssl x509 -noout -issuer -dates
 ```
 
 Add `--staging` first if you're unsure — Let's Encrypt rate-limits to 5 failures

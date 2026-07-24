@@ -36,8 +36,8 @@ server {
 
     resolver 127.0.0.11 valid=30s ipv6=off;
 
-    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    ssl_certificate     ${CERT_DIR}/fullchain.pem;
+    ssl_certificate_key ${CERT_DIR}/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_session_cache   shared:SSL:10m;
     ssl_session_timeout 1d;
