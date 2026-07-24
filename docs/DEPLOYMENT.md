@@ -172,7 +172,11 @@ docker compose -f docker-compose.prod.yml run --rm --entrypoint sh certbot -c '
          /etc/letsencrypt/archive/reader.bharathiyavidyalaya.com \
          /etc/letsencrypt/renewal/reader.bharathiyavidyalaya.com.conf'
 
-docker compose -f docker-compose.prod.yml run --rm certbot \
+# --entrypoint certbot is REQUIRED. The service's entrypoint is the renewal
+# loop; `run` replaces the command but keeps the entrypoint, so without this
+# override the container runs `certbot renew` and then sleeps 12h — it looks
+# like a hang, and no certificate is ever issued.
+docker compose -f docker-compose.prod.yml run --rm --entrypoint certbot certbot \
   certonly --webroot -w /var/www/certbot \
   -d reader.bharathiyavidyalaya.com \
   --email you@example.com --agree-tos --no-eff-email
