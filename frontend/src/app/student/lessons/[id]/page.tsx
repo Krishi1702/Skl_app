@@ -12,6 +12,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import PdfViewer from "@/components/student/PdfViewer";
 import {
   Mic, Square, Globe, ChevronLeft, TrendingUp,
   CheckCircle2, AlertCircle, Star, ExternalLink,
@@ -325,12 +326,12 @@ export default function LessonDetailPage() {
                 {/* ── Read Tab ── */}
                 <TabsContent value="read" className="mt-0">
                   {pdfUrlData?.url ? (
-                    <iframe
-                      src={pdfUrlData.url}
-                      title={lesson.title}
-                      className="w-full rounded-lg border bg-muted/20"
+                    <div
+                      className="w-full rounded-lg border bg-muted/20 overflow-y-auto"
                       style={{ height: "530px" }}
-                    />
+                    >
+                      <PdfViewer url={pdfUrlData.url} />
+                    </div>
                   ) : lesson.pdf_extraction_status === "pending" ? (
                     <div className="rounded-lg bg-muted/30 flex items-center justify-center" style={{ height: "530px" }}>
                       <div className="text-center space-y-2">
@@ -358,13 +359,9 @@ export default function LessonDetailPage() {
                 <TabsContent value="listen" className="mt-0">
                   <div className="rounded-xl border bg-muted/10 flex flex-col overflow-hidden" style={{ height: "530px" }}>
                     {/* PDF viewer — follow along while listening */}
-                    <div className="border-b" style={{ height: "295px" }}>
+                    <div className="border-b overflow-y-auto" style={{ height: "295px" }}>
                       {pdfUrlData?.url ? (
-                        <iframe
-                          src={pdfUrlData.url}
-                          title={lesson.title}
-                          className="w-full h-full rounded-t-xl"
-                        />
+                        <PdfViewer url={pdfUrlData.url} />
                       ) : (
                         <div className="flex items-center justify-center h-full bg-muted/20 rounded-t-xl">
                           <p className="text-xs text-muted-foreground">PDF loading…</p>

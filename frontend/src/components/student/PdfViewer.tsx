@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { ChevronLeft, ChevronRight, FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
@@ -13,6 +13,25 @@ export default function PdfViewer({ url }: PdfViewerProps) {
   const [numPages, setNumPages] = useState(0);
   const [page, setPage] = useState(1);
   const [ready, setReady] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [containerWidth, setContainerWidth] = useState(680);
+
+  // Measure the actual space available (not the raw window width) so the
+  // page fits its card on both the two-column desktop layout and mobile.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const update = () => setContainerWidth(el.clientWidth);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  // Reset to page 1 whenever a different PDF is loaded
+  useEffect(() => {
+    setPage(1);
+  }, [url]);
 
   // Lazy-load react-pdf only in the browser
   const [PdfComponents, setPdfComponents] = useState<{
@@ -47,7 +66,7 @@ export default function PdfViewer({ url }: PdfViewerProps) {
 
   if (!ready || !PdfComponents) {
     return (
-      <div className="flex flex-col items-center justify-center h-96 gap-3 bg-muted/30 rounded-xl">
+      <div ref={containerRef} className="flex flex-col items-center justify-center h-96 gap-3 bg-muted/30 rounded-xl">
         <FileText className="h-10 w-10 text-muted-foreground/40 animate-pulse" />
         <p className="text-sm text-muted-foreground">Loading PDF…</p>
       </div>
@@ -55,10 +74,10 @@ export default function PdfViewer({ url }: PdfViewerProps) {
   }
 
   const { Document, Page } = PdfComponents;
-  const viewWidth = typeof window !== "undefined" ? Math.min(680, window.innerWidth - 80) : 680;
+  const viewWidth = Math.max(200, containerWidth - 16);
 
   return (
-    <div className="bg-muted/30 rounded-xl overflow-hidden flex flex-col items-center border">
+    <div ref={containerRef} className="bg-muted/30 rounded-xl overflow-hidden flex flex-col items-center border">
       <Document
         file={url}
         onLoadSuccess={({ numPages }: { numPages: number }) => setNumPages(numPages)}
