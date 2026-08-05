@@ -12,7 +12,6 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import PdfViewer from "@/components/student/PdfViewer";
 import {
   Mic, Square, Globe, ChevronLeft, TrendingUp,
   CheckCircle2, AlertCircle, Star, ExternalLink,
@@ -30,9 +29,24 @@ const RATE_OPTIONS = [
   { label: "Fast", value: "fast" as const },
 ];
 
+// ─── Mobile detection (matches Tailwind `lg` breakpoint) ─────────────────────
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 1023px)");
+    const update = () => setIsMobile(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
+  return isMobile;
+}
+
 export default function LessonDetailPage() {
   const params = useParams();
   const lessonId = (params?.id ?? "") as string;
+
+  const isMobile = useIsMobile();
 
   const { data: lesson, isLoading, isError } = useStudentLesson(lessonId);
   const { data: pdfUrlData } = useStudentLessonPdfUrl(lessonId);
@@ -272,7 +286,8 @@ export default function LessonDetailPage() {
 
   return (
     <StudentLayout breadcrumbs={[{ label: "Student" }, { label: "Lessons", href: "/student/lessons" }, { label: lesson.title }]}>
-      <div className="space-y-4">
+      {/* pb leaves room for the mobile sticky mic bar */}
+      <div className="space-y-4 pb-24 lg:pb-0">
         {/* Header */}
         <div className="flex items-center gap-3">
           <Link href="/student/lessons">
@@ -326,12 +341,33 @@ export default function LessonDetailPage() {
                 {/* ── Read Tab ── */}
                 <TabsContent value="read" className="mt-0">
                   {pdfUrlData?.url ? (
-                    <div
-                      className="w-full rounded-lg border bg-muted/20 overflow-y-auto"
-                      style={{ height: "530px" }}
-                    >
-                      <PdfViewer url={pdfUrlData.url} />
-                    </div>
+                    isMobile ? (
+                      // Mobile browsers can't render a PDF inside an iframe — they show a
+                      // download stub that navigates away from the page (and away from the
+                      // mic). Show the extracted text inline instead so reading and
+                      // recording stay on one screen.
+                      <div
+                        className="rounded-lg border bg-background overflow-y-auto p-4"
+                        style={{ height: "45vh" }}
+                      >
+                        {extractedText ? (
+                          <p className="text-[15px] leading-7 whitespace-pre-wrap">{extractedText}</p>
+                        ) : (
+                          <div className="h-full flex items-center justify-center text-center">
+                            <p className="text-sm text-muted-foreground px-4">
+                              Text preview unavailable. Use “New tab” above to open the PDF.
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <iframe
+                        src={pdfUrlData.url}
+                        title={lesson.title}
+                        className="w-full rounded-lg border bg-muted/20"
+                        style={{ height: "530px" }}
+                      />
+                    )
                   ) : lesson.pdf_extraction_status === "pending" ? (
                     <div className="rounded-lg bg-muted/30 flex items-center justify-center" style={{ height: "530px" }}>
                       <div className="text-center space-y-2">
@@ -351,7 +387,9 @@ export default function LessonDetailPage() {
                     </div>
                   )}
                   <p className="text-xs text-muted-foreground mt-2 text-center">
-                    Read carefully, then record your reading session on the right
+                    {isMobile
+                      ? "Read carefully, then tap the mic bar at the bottom to record"
+                      : "Read carefully, then record your reading session on the right"}
                   </p>
                 </TabsContent>
 
@@ -359,9 +397,21 @@ export default function LessonDetailPage() {
                 <TabsContent value="listen" className="mt-0">
                   <div className="rounded-xl border bg-muted/10 flex flex-col overflow-hidden" style={{ height: "530px" }}>
                     {/* PDF viewer — follow along while listening */}
-                    <div className="border-b overflow-y-auto" style={{ height: "295px" }}>
-                      {pdfUrlData?.url ? (
-                        <PdfViewer url={pdfUrlData.url} />
+                    <div className="border-b" style={{ height: "295px" }}>
+                      {isMobile ? (
+                        <div className="h-full overflow-y-auto p-4 bg-background rounded-t-xl">
+                          {extractedText ? (
+                            <p className="text-[15px] leading-7 whitespace-pre-wrap">{extractedText}</p>
+                          ) : (
+                            <p className="text-xs text-muted-foreground text-center">Text unavailable</p>
+                          )}
+                        </div>
+                      ) : pdfUrlData?.url ? (
+                        <iframe
+                          src={pdfUrlData.url}
+                          title={lesson.title}
+                          className="w-full h-full rounded-t-xl"
+                        />
                       ) : (
                         <div className="flex items-center justify-center h-full bg-muted/20 rounded-t-xl">
                           <p className="text-xs text-muted-foreground">PDF loading…</p>
@@ -462,7 +512,7 @@ export default function LessonDetailPage() {
                     </div>
                   </div>
                   <p className="text-xs text-muted-foreground mt-2 text-center">
-                    Follow along in the PDF while the AI reads clearly in Indian English.
+                    Follow along {isMobile ? "with the text" : "in the PDF"} while the AI reads clearly in Indian English.
                   </p>
                   {/* Hidden audio element for TTS playback */}
                   <audio
@@ -524,8 +574,8 @@ export default function LessonDetailPage() {
                   </div>
                 )}
 
-                {/* Buttons */}
-                <div className="flex justify-center gap-3">
+                {/* Buttons — on mobile these live in the sticky bar at the bottom */}
+                <div className="hidden lg:flex justify-center gap-3">
                   {phase === "idle" && (
                     <Button
                       size="lg"
@@ -589,6 +639,62 @@ export default function LessonDetailPage() {
             </Card>
           </div>
         </div>
+      </div>
+
+      {/* ── Mobile Sticky Mic Bar ────────────────────────────────────── */}
+      {/* Keeps recording reachable from the reading screen on phones, where the
+          Recording Studio card would otherwise sit far below the fold. */}
+      <div
+        className="lg:hidden fixed inset-x-0 bottom-0 z-30 border-t bg-background/95 backdrop-blur px-4 py-3 shadow-[0_-2px_12px_rgba(0,0,0,0.2)]"
+        style={{ paddingBottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}
+      >
+        {phase === "idle" && (
+          <Button
+            size="lg"
+            className="w-full gap-2 bg-green-600 hover:bg-green-700"
+            onClick={handleStartRecording}
+            disabled={startSession.isPending || !pdfReady}
+          >
+            <Mic className="h-5 w-5" />
+            {!pdfReady ? "PDF Not Ready" : "Start Recording"}
+          </Button>
+        )}
+
+        {phase === "recording" && (
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className="h-2.5 w-2.5 rounded-full bg-red-500 animate-pulse" />
+              <span className="text-sm font-mono font-bold">{formatTime(recordingTime)}</span>
+            </div>
+            <Button size="lg" variant="destructive" className="flex-1 gap-2" onClick={handleStopRecording}>
+              <Square className="h-4 w-4" /> Stop &amp; Submit
+            </Button>
+            <Button size="lg" variant="outline" onClick={handleAbandon}>Cancel</Button>
+          </div>
+        )}
+
+        {(phase === "submitting" || phase === "processing") && (
+          <Button size="lg" disabled className="w-full gap-2">
+            <div className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+            {phase === "submitting" ? "Transcribing audio…" : "Analysing reading…"}
+          </Button>
+        )}
+
+        {phase === "done" && (
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="lg"
+              className="flex-1"
+              onClick={() => { setPhase("idle"); setRecordingTime(0); setSessionId(null); setAssessmentStatus(null); }}
+            >
+              Try Again
+            </Button>
+            <Button size="lg" className="flex-1 gap-2" onClick={() => setShowResult(true)}>
+              <TrendingUp className="h-4 w-4" /> View Results
+            </Button>
+          </div>
+        )}
       </div>
 
       {/* ── Assessment Result Dialog ─────────────────────────────────── */}
